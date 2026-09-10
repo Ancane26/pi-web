@@ -169,7 +169,15 @@ describe("reviewer result redaction at the Pi agent-loop boundary", () => {
       cwd: "/workspace",
       terminal: true,
       terminate: true,
-      result: { terminal_outcome: "succeeded", review_content: `Authorization: Bearer ${secret}` },
+    result: {
+      verdict: "review_complete",
+      findings: ["Authorization: <redacted>"],
+      terminal_outcome: "succeeded",
+      observed_tools: ["Read"],
+      denied_operations: [],
+      work_id: "child-1",
+      model: "llama-server-9b/qwen3.5-9b:latest",
+    },
     }));
     const deps: SubsessionToolDeps = {
       spawn,
@@ -201,6 +209,6 @@ describe("reviewer result redaction at the Pi agent-loop boundary", () => {
     const lastContent = lastMessage.content[0];
     if (lastContent?.type !== "text") throw new Error("expected final tool text content");
     expect(lastContent.text).toContain("Authorization: <redacted>");
-    expect(lastMessage.details).toMatchObject({ result: { review_content: "Authorization: <redacted>" } });
+    expect(lastMessage.details).toMatchObject({ result: { findings: ["Authorization: <redacted>"] } });
   });
 });

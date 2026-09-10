@@ -1,8 +1,7 @@
 import { Type } from "typebox";
 import { defineTool, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TranscriptContentKind, TranscriptEntry, TranscriptRole, TranscriptView } from "./subsessionTranscript.js";
-import type { ReviewerAuthorityRecord } from "./harnessReviewerBridge.js";
-import { sanitizeReviewerBridgePayload } from "./reviewerBridgeRedaction.js";
+import type { ReviewerAuthorityRecord, ReviewerResult } from "./harnessReviewerBridge.js";
 
 /** Lifecycle phase of a tracked subsession as seen by its parent. */
 export type SubsessionStatus = "working" | "idle" | "error" | "unknown";
@@ -15,7 +14,7 @@ export interface SpawnSubsessionResult {
   reviewerAuthority?: ReviewerAuthorityRecord;
   terminal?: boolean;
   terminate?: boolean;
-  result?: Record<string, unknown>;
+  result?: Record<string, unknown> | ReviewerResult;
 }
 
 export type SpawnSubsessionModel = NonNullable<ExtensionContext["model"]>;
@@ -150,17 +149,6 @@ function statusLine(summary: SubsessionSummary): string {
   return `- ${summary.sessionId} [${summary.status}] in ${summary.cwd}`;
 }
 
-function isSpawnSubsessionResult(value: unknown): value is SpawnSubsessionResult {
-  if (!isRecord(value)) return false;
-  const { cwd, sessionId, model, terminal, terminate, result } = value;
-  return typeof cwd === "string"
-    && (sessionId === undefined || typeof sessionId === "string")
-    && (model === undefined || typeof model === "string")
-    && (terminal === undefined || typeof terminal === "boolean")
-    && (terminate === undefined || typeof terminate === "boolean")
-    && (result === undefined || isRecord(result));
-}
-
 function workingInspectionGuidance(sessionId: string): string {
   return `Subsession ${sessionId} is working; partial output is withheld. Continue other work, or call yield_to_subsessions alone and last at the join point. Completion notices wake you; do not poll.`;
 }
@@ -243,15 +231,14 @@ export function createSubsessionToolDefinitions(spawningCwd: string, deps: Subse
         ...(params.logicalRole === undefined ? {} : { logicalRole: params.logicalRole }),
         ...(signal === undefined ? {} : { signal }),
       });
-      const sanitizedResult = params.logicalRole === "reviewer" ? sanitizeReviewerBridgePayload({ ...result }) : undefined;
-      const safeResult = sanitizedResult !== undefined && isSpawnSubsessionResult(sanitizedResult) ? sanitizedResult : result;
-      const terminalOutcome = safeResult.result?.["terminal_outcome"];
-      const failureCode = safeResult.result?.["failure_code"];
-      const reviewContent = safeResult.result?.["review_content"];
+      const safeResult = result;
+      const resultRecord = isRecord(safeResult.result) ? safeResult.result : undefined;
+      const terminalOutcome = resultRecord?.["terminal_outcome"];
+      const findings = resultRecord?.["findings"];
       const terminalText = safeResult.terminal === true
-        ? typeof reviewContent === "string" && reviewContent.trim() !== ""
-          ? `${reviewContent}\n\nReviewer completed${typeof terminalOutcome === "string" ? ` with outcome ${terminalOutcome}` : ""}. Do not retry this request.`
-          : `Tracked subsession ended terminally${typeof terminalOutcome === "string" ? ` with outcome ${terminalOutcome}` : ""}${typeof failureCode === "string" ? ` (${failureCode})` : ""}. Do not retry this request.`
+        ? Array.isArray(findings) && findings.length > 0
+          ? `${findings.join("\n\n")}\n\nReviewer completed${typeof terminalOutcome === "string" ? ` with outcome ${terminalOutcome}` : ""}. Do not retry this request.`
+          : `Tracked subsession ended terminally${typeof terminalOutcome === "string" ? ` with outcome ${terminalOutcome}` : ""}. Do not retry this request.`
         : undefined;
       const modelNote = safeResult.model === undefined ? "" : ` using model ${safeResult.model}`;
       const toolResult = {

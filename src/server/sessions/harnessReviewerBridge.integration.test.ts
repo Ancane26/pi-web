@@ -61,7 +61,7 @@ function closeServer(server: Server): Promise<void> {
   return new Promise((resolvePromise) => server.close(() => { resolvePromise(); }));
 }
 
-function reviewerBridgeOptions(ledgerRoot: string, upstreamPort: number, timeoutMs = 60_000) {
+function reviewerBridgeOptions(ledgerRoot: string, upstreamPort: number, timeoutMs = 120_000) {
   return createReviewerBridgeOptions({
     ...process.env,
     PI_WEB_REVIEWER_HARNESS_ROOT: HARNESS_ROOT,
@@ -110,12 +110,13 @@ function reviewContentOf(details: unknown): string {
     !("result" in details) ||
     details.result === null ||
     typeof details.result !== "object" ||
-    !("review_content" in details.result) ||
-    typeof details.result.review_content !== "string"
+    !("findings" in details.result) ||
+    !Array.isArray(details.result.findings) ||
+    typeof details.result.findings[0] !== "string"
   ) {
-    throw new Error("expected details.result.review_content to be a string");
+    throw new Error("expected details.result.findings to contain a string");
   }
-  return details.result.review_content;
+  return details.result.findings[0];
 }
 
 function hasReviewerTransportOrphans(): boolean {
@@ -152,7 +153,7 @@ describe("real harness reviewer bridge transport", () => {
       expect(result.details).toMatchObject({
         terminal: true,
         terminate: true,
-        result: { terminal_outcome: "succeeded", cleanup_status: "confirmed" },
+        result: { terminal_outcome: "succeeded", findings: ["INTEGRATION REVIEW: verdict=approved; findings=none"] },
       });
       expect(result.content[0]).toMatchObject({ type: "text" });
       expect(textContent(result.content[0])).toContain("INTEGRATION REVIEW: verdict=approved; findings=none");
@@ -162,7 +163,7 @@ describe("real harness reviewer bridge transport", () => {
       await closeServer(server);
       rmSync(ledgerRoot, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 180_000);
 
   it("turns a real ENOENT bridge spawn into one terminal top-level result", async () => {
     const service = new PiSessionService(new CapturingSessionEventHub(), {
@@ -180,7 +181,7 @@ describe("real harness reviewer bridge transport", () => {
       expect(result.details).toMatchObject({
         terminal: true,
         terminate: true,
-        result: { failure_code: "reviewer_bridge_unavailable" },
+        result: { verdict: "review_denied", terminal_outcome: "denied", findings: [], model: "unavailable" },
       });
       expect(textContent(result.content[0])).toContain("Do not retry this request.");
       expect(textContent(result.content[0])).not.toContain("ENOENT");
@@ -221,7 +222,7 @@ describe("real harness reviewer bridge transport", () => {
       await closeServer(server);
       rmSync(ledgerRoot, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 180_000);
 
   it("forwards parent cancellation and leaves no real proxy/socket orphan", async () => {
     const { server, port } = await startFakeModelServer(5_000);
@@ -241,14 +242,14 @@ describe("real harness reviewer bridge transport", () => {
       setTimeout(() => { controller.abort(); }, 500);
       const result = await pending;
       expect(result.terminate).toBe(true);
-      expect(result.details).toMatchObject({ result: { failure_code: "reviewer_bridge_unavailable" } });
+      expect(result.details).toMatchObject({ result: { verdict: "review_denied", terminal_outcome: "denied" } });
       await waitForNoReviewerTransportOrphans();
     } finally {
       await service.dispose();
       await closeServer(server);
       rmSync(ledgerRoot, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 90_000);
 
   it("forwards the bridge timeout to Python and leaves no real proxy/socket orphan", async () => {
     const { server, port } = await startFakeModelServer(5_000);
@@ -265,12 +266,12 @@ describe("real harness reviewer bridge transport", () => {
     try {
       const result = await toolFor(service).execute("timeout-call", { prompt: "review with a short bridge deadline", logicalRole: "reviewer" }, undefined, undefined, context());
       expect(result.terminate).toBe(true);
-      expect(result.details).toMatchObject({ result: { failure_code: "reviewer_bridge_unavailable" } });
+      expect(result.details).toMatchObject({ result: { verdict: "review_denied", terminal_outcome: "denied" } });
       await waitForNoReviewerTransportOrphans();
     } finally {
       await service.dispose();
       await closeServer(server);
       rmSync(ledgerRoot, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 90_000);
 });

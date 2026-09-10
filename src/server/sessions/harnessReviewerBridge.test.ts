@@ -56,9 +56,13 @@ describe("harness reviewer bridge boundary", () => {
       terminal: true,
       terminate: true,
       result: {
-        schema_version: "2.0",
+        verdict: "review_denied",
+        findings: [],
         terminal_outcome: "denied",
-        failure_code: "reviewer_operation_denied",
+        observed_tools: [],
+        denied_operations: [{ reason: "unlisted_tool_denied" }],
+        work_id: "parent-1-reviewer-denied",
+        model: "llama-server-9b/qwen3.5-9b:latest",
       },
     }));
     const result = await spawnTool(definitions(spawn)).execute("call-2", { prompt: "review", logicalRole: "reviewer" }, undefined, undefined, context());
@@ -87,15 +91,13 @@ describe("harness reviewer bridge boundary", () => {
           terminal: true,
           terminate: true,
           result: {
-            schema_version: "2.0",
             work_id: "parent-1-reviewer-denied",
-            attempt: 1,
-            result_id: "parent-1-reviewer-denied",
+            model: "llama-server-9b/qwen3.5-9b:latest",
+            verdict: "review_denied" as const,
+            findings: [],
             terminal_outcome: "denied",
-            failure_code: "reviewer_operation_denied",
-            result_ref: null,
-            partial: false,
-            error: null,
+            observed_tools: [],
+            denied_operations: [{ reason: "unlisted_tool_denied" as const }],
           },
         });
       }),
@@ -154,15 +156,20 @@ describe("harness reviewer bridge boundary", () => {
     expect(failure.message).toBe("Harness reviewer bridge child exited with status 7");
   });
 
-  it("sanitizes bridge result strings before tool content and details cross into Pi", async () => {
+  it("accepts only the allowlisted result object before tool content and details cross into Pi", async () => {
     const secret = "SYNTH_PI_RESULT_SECRET";
     const bridgePayload = JSON.stringify({
       cwd: "/workspace",
       terminal: true,
       terminate: true,
       result: {
+        verdict: "review_complete",
+        findings: ["Authorization: <redacted>"],
         terminal_outcome: "succeeded",
-        review_content: `Authorization: Bearer ${secret}`,
+        observed_tools: ["Read"],
+        denied_operations: [],
+        work_id: "bridge-test",
+        model: "llama-server-9b/qwen3.5-9b:latest",
       },
     });
     const bridge = new ExecFileHarnessReviewerBridge({
@@ -191,7 +198,7 @@ describe("harness reviewer bridge boundary", () => {
 
       expect(serialized).not.toContain(secret);
       expect(serialized).toContain("Authorization: <redacted>");
-      expect(result.details).toMatchObject({ result: { review_content: "Authorization: <redacted>" } });
+      expect(result.details).toMatchObject({ result: { findings: ["Authorization: <redacted>"] } });
       expect(textContent(result.content[0])).toContain("Authorization: <redacted>");
     } finally {
       await service.dispose();

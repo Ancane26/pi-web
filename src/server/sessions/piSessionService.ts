@@ -1542,15 +1542,13 @@ export class PiSessionService implements SessionRouteService {
           terminal: true,
           terminate: true,
           result: {
-            schema_version: "2.0",
-            work_id: `${input.parentSessionId}-reviewer-denied`,
-            attempt: 1,
-            result_id: `${input.parentSessionId}-reviewer-denied`,
+            verdict: "review_denied",
+            findings: [],
             terminal_outcome: "denied",
-            failure_code: "reviewer_bridge_unavailable",
-            result_ref: null,
-            partial: false,
-            error: { schema_version: "2.0", code: "REVIEWER_BRIDGE_UNAVAILABLE", message: "isolated REVIEWER bridge is not available", retryable: false },
+            observed_tools: [],
+            denied_operations: [{ reason: "tool_execution_denied" }],
+            work_id: `${input.parentSessionId}-reviewer-denied`,
+            model: "unavailable",
           },
         };
       }
@@ -1572,15 +1570,13 @@ export class PiSessionService implements SessionRouteService {
           terminal: true,
           terminate: true,
           result: {
-            schema_version: "2.0",
-            work_id: `${input.parentSessionId}-reviewer-unavailable`,
-            attempt: 1,
-            result_id: `${input.parentSessionId}-reviewer-unavailable`,
+            verdict: "review_denied",
+            findings: [],
             terminal_outcome: "denied",
-            failure_code: "reviewer_bridge_unavailable",
-            result_ref: null,
-            partial: false,
-            error: { schema_version: "2.0", code: "REVIEWER_BRIDGE_UNAVAILABLE", message: "isolated REVIEWER bridge transport failed", retryable: false },
+            observed_tools: [],
+            denied_operations: [{ reason: "tool_execution_denied" }],
+            work_id: `${input.parentSessionId}-reviewer-unavailable`,
+            model: "unavailable",
           },
         };
       }

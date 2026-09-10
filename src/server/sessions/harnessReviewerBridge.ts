@@ -1,5 +1,4 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { sanitizeReviewerBridgePayload } from "./reviewerBridgeRedaction.js";
 
 /** Server-owned facts supplied to the harness bridge. No capability, path,
  * policy, digest, or native-tool field is accepted from the Pi Web tool. */
@@ -23,6 +22,19 @@ export interface ReviewerAuthorityRecord {
   terminalResultPointer?: { label: string; digest: string; redacted: true };
 }
 
+export type ReviewerToolName = "Read" | "Grep" | "Glob";
+export type ReviewerDenialReason = "unlisted_tool_denied" | "outside_worktree_denied" | "user_bash_denied" | "tool_execution_denied";
+
+export interface ReviewerResult {
+  verdict: "review_complete" | "review_denied" | "review_failed";
+  findings: string[];
+  terminal_outcome: string;
+  observed_tools: ReviewerToolName[];
+  denied_operations: { reason: ReviewerDenialReason; tool?: ReviewerToolName }[];
+  work_id: string;
+  model: string;
+}
+
 export interface ReviewerBridgeLaunchResult {
   sessionId?: string;
   cwd: string;
@@ -30,7 +42,7 @@ export interface ReviewerBridgeLaunchResult {
   terminal: boolean;
   terminate: boolean;
   reviewerAuthority?: ReviewerAuthorityRecord;
-  result?: Record<string, unknown>;
+  result?: ReviewerResult;
 }
 
 export interface HarnessReviewerBridge {
@@ -59,6 +71,21 @@ function isReviewerBridgeLaunchResult(value: unknown): value is ReviewerBridgeLa
   return typeof cwd === "string" && typeof terminal === "boolean" && typeof terminate === "boolean";
 }
 
+function isReviewerResult(value: unknown): value is ReviewerResult {
+  if (!isRecord(value) || Object.keys(value).sort().join(",") !== ["denied_operations", "findings", "model", "observed_tools", "terminal_outcome", "verdict", "work_id"].join(",")) return false;
+  if (value["verdict"] !== "review_complete" && value["verdict"] !== "review_denied" && value["verdict"] !== "review_failed") return false;
+  if (!Array.isArray(value["findings"]) || value["findings"].some((item) => typeof item !== "string" || item.length > 12_000)) return false;
+  if (typeof value["terminal_outcome"] !== "string" || typeof value["work_id"] !== "string" || typeof value["model"] !== "string") return false;
+  const tools = value["observed_tools"];
+  if (!Array.isArray(tools) || tools.some((tool) => tool !== "Read" && tool !== "Grep" && tool !== "Glob")) return false;
+  const denials = value["denied_operations"];
+  if (!Array.isArray(denials)) return false;
+  return denials.every((item) => {
+    if (!isRecord(item) || Object.keys(item).some((key) => key !== "reason" && key !== "tool") || (item["reason"] !== "unlisted_tool_denied" && item["reason"] !== "outside_worktree_denied" && item["reason"] !== "user_bash_denied" && item["reason"] !== "tool_execution_denied")) return false;
+    return item["tool"] === undefined || item["tool"] === "Read" || item["tool"] === "Grep" || item["tool"] === "Glob";
+  });
+}
+
 function signalChildGroup(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
   if (child.pid === undefined) return;
   try {
@@ -79,11 +106,19 @@ function checkedResult(value: unknown): ReviewerBridgeLaunchResult {
   if (typeof result["cwd"] !== "string" || typeof result["terminal"] !== "boolean" || typeof result["terminate"] !== "boolean") {
     throw new Error("Harness reviewer bridge result omitted terminal authority fields");
   }
-  const sanitized = sanitizeReviewerBridgePayload(result);
-  if (!isReviewerBridgeLaunchResult(sanitized)) {
+  if (result["result"] !== undefined && !isReviewerResult(result["result"])) {
+    throw new Error("Harness reviewer bridge returned a malformed allowlisted reviewer result");
+  }
+  if (!isReviewerBridgeLaunchResult(result)) {
     throw new Error("Harness reviewer bridge result omitted terminal authority fields");
   }
-  return sanitized;
+  // Defense in depth only: Python is the canonical findings sanitizer. This
+  // assertion is deliberately a single narrow bearer-shaped backstop, not a
+  // second recursive sanitizer implementation.
+  if (result.result?.findings.some((finding) => /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/i.test(finding)) === true) {
+    throw new Error("Harness reviewer bridge returned an unsafe findings value");
+  }
+  return result;
 }
 
 /**
