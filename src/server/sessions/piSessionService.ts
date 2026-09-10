@@ -81,6 +81,7 @@ import { ExtensionDialogWaiters, effectiveExtensionDialogTimeoutMs, extensionDia
 import { DEFAULT_EXTENSION_DIALOGS_TIMEOUT_MS } from "../../config.js";
 import { createSpawnSessionToolDefinition, type SpawnSessionInvocation, type SpawnSessionResult } from "./spawnSessionTool.js";
 import { createSubsessionToolDefinitions, type SpawnSubsessionInvocation, type SpawnSubsessionResult, type SubsessionCheckResult, type SubsessionReadQuery, type SubsessionReadResult, type SubsessionStatus, type SubsessionSummary, type SubsessionToolDeps } from "./spawnSubsessionTool.js";
+import type { HarnessReviewerBridge, ReviewerAuthorityRecord, ReviewerBridgeLaunchResult } from "./harnessReviewerBridge.js";
 import { buildTranscriptView } from "./subsessionTranscript.js";
 import { planSessionCleanup, summarizeSessionCleanupExecution, type NormalizedSessionCleanupRequest, type SessionCleanupPlan } from "./sessionCleanup.js";
 import type { SpawnTargetDecision, SpawnTargetResolver } from "./spawnTargetResolver.js";
@@ -244,6 +245,7 @@ interface TrackedSubsessionLink {
   childSessionFile?: string;
   parentSessionFile?: string;
   cwd?: string;
+  reviewerAuthority?: ReviewerAuthorityRecord;
 }
 
 interface PersistedParentSubsessionLink {
@@ -251,6 +253,7 @@ interface PersistedParentSubsessionLink {
   spawnedSessionId: string;
   spawnedSessionFile?: string;
   cwd?: string;
+  reviewerAuthority?: ReviewerAuthorityRecord;
 }
 
 interface PersistedChildSubsessionLink {
@@ -1071,6 +1074,8 @@ export interface PiSessionServiceDependencies {
    * delegation. On by default; the operator opts out via config or environment.
    */
   subsessionsEnabled?: boolean;
+  /** Role-specific isolated reviewer bridge; generic children never use it. */
+  reviewerBridge?: HarnessReviewerBridge;
   /**
    * When true, `ask_user` is available to every session, so an agent can post a
    * question set to the browser. Independent of the delegation capabilities: the
@@ -1186,6 +1191,7 @@ export class PiSessionService implements SessionRouteService {
   private readonly modelRuntime: ModelRuntime;
   private readonly workspaceActivity: Pick<WorkspaceActivityService, "applySessionStatus" | "applySessionActivity" | "removeSession" | "reconcileSessionActivity"> | undefined;
   private readonly spawnTargets: SpawnTargetResolver | undefined;
+  private readonly reviewerBridge: HarnessReviewerBridge | undefined;
   private readonly logger: PiSessionLogger;
   private readonly now: () => Date;
   private readonly notificationStore: SessionNotificationStore;
@@ -1216,6 +1222,7 @@ export class PiSessionService implements SessionRouteService {
     this.sessionManager = deps.sessionManager;
     this.modelRuntime = deps.modelRuntime;
     this.spawnTargets = deps.spawnTargets;
+    this.reviewerBridge = deps.reviewerBridge;
     this.logger = deps.logger ?? noopLogger;
     this.now = deps.now ?? (() => new Date());
     this.notificationStore = deps.notificationStore ?? new SessionNotificationStore();
@@ -1528,6 +1535,74 @@ export class PiSessionService implements SessionRouteService {
     // from an unregistered directory, which keeps the child visible in the UI.
     const decision = await this.spawnTargets.resolveSpawnTarget(input.spawningCwd, undefined);
     if (!decision.allowed) throw spawnTargetError(decision);
+    if (input.logicalRole === "reviewer") {
+      if (this.reviewerBridge === undefined) {
+        return {
+          cwd: decision.cwd,
+          terminal: true,
+          terminate: true,
+          result: {
+            schema_version: "2.0",
+            work_id: `${input.parentSessionId}-reviewer-denied`,
+            attempt: 1,
+            result_id: `${input.parentSessionId}-reviewer-denied`,
+            terminal_outcome: "denied",
+            failure_code: "reviewer_bridge_unavailable",
+            result_ref: null,
+            partial: false,
+            error: { schema_version: "2.0", code: "REVIEWER_BRIDGE_UNAVAILABLE", message: "isolated REVIEWER bridge is not available", retryable: false },
+          },
+        };
+      }
+      let bridged: ReviewerBridgeLaunchResult;
+      try {
+        bridged = await this.reviewerBridge.launch({
+          parentSessionId: input.parentSessionId,
+          parentSessionFile: input.parentSessionFile,
+          prompt: input.prompt,
+          ...(input.signal === undefined ? {} : { signal: input.signal }),
+        });
+      } catch {
+        // Transport failures are terminal authority failures, not ordinary Pi
+        // tool errors. In particular ENOENT, timeout, cancellation, malformed
+        // JSON, and a child protocol error must not invite the parent model to
+        // retry the same unavailable reviewer route.
+        return {
+          cwd: decision.cwd,
+          terminal: true,
+          terminate: true,
+          result: {
+            schema_version: "2.0",
+            work_id: `${input.parentSessionId}-reviewer-unavailable`,
+            attempt: 1,
+            result_id: `${input.parentSessionId}-reviewer-unavailable`,
+            terminal_outcome: "denied",
+            failure_code: "reviewer_bridge_unavailable",
+            result_ref: null,
+            partial: false,
+            error: { schema_version: "2.0", code: "REVIEWER_BRIDGE_UNAVAILABLE", message: "isolated REVIEWER bridge transport failed", retryable: false },
+          },
+        };
+      }
+      if (bridged.terminal) return { ...bridged, cwd: decision.cwd };
+      if (bridged.sessionId === undefined || bridged.reviewerAuthority === undefined) {
+        throw new Error("Reviewer bridge returned a non-terminal result without an authority handle");
+      }
+      const reviewerLink: TrackedSubsessionLink = {
+        parentSessionId: input.parentSessionId,
+        childSessionId: bridged.sessionId,
+        ...(input.parentSessionFile === undefined ? {} : { parentSessionFile: input.parentSessionFile }),
+        cwd: decision.cwd,
+        reviewerAuthority: bridged.reviewerAuthority,
+      };
+      await this.registerVerifiedSubsession(reviewerLink);
+      this.persistSubsessionLink(reviewerLink);
+      this.logger.info(
+        { parentSessionId: input.parentSessionId, sessionId: bridged.sessionId, cwd: decision.cwd, promptLength: input.prompt.length },
+        "spawn_subsession started an isolated reviewer child",
+      );
+      return { ...bridged, cwd: decision.cwd };
+    }
     // A model spec overrides the inherited model and is resolved against the
     // parent's model runtime; only a spec resolves against the parent.
     const model = input.modelSpec === undefined
@@ -2127,6 +2202,7 @@ export class PiSessionService implements SessionRouteService {
   }
 
   private async parentLinkHasValidChildTarget(parentSessionFile: string, link: PersistedParentSubsessionLink): Promise<boolean> {
+    if (link.reviewerAuthority !== undefined) return true;
     return link.spawnedSessionFile !== undefined
       && await sessionFileHeaderMatches(link.spawnedSessionFile, { sessionId: link.spawnedSessionId, parentSessionFile });
   }
@@ -2152,6 +2228,13 @@ export class PiSessionService implements SessionRouteService {
 
     const active = this.activeChildForSubsessionLink(link);
     if (active !== undefined) return active.runtime.session;
+
+    if (link.reviewerAuthority !== undefined) {
+      if (this.reviewerBridge === undefined || !(await this.reviewerBridge.revalidate(link.reviewerAuthority))) {
+        throw new Error("Reviewer authority could not be revalidated");
+      }
+      throw new Error("Reviewer child is an external authority session and has no generic Pi session file");
+    }
 
     if (link.childSessionFile !== undefined) {
       if (!(await sessionFileHeaderMatches(link.childSessionFile, { sessionId, parentSessionFile: link.parentSessionFile }))) throw new Error("Session not found");
@@ -4565,6 +4648,7 @@ function trackedSubsessionLinkFromParentLink(parentSessionId: string, link: Pers
     ...(link.spawnedSessionFile === undefined ? {} : { childSessionFile: link.spawnedSessionFile }),
     parentSessionFile,
     ...(link.cwd === undefined ? {} : { cwd: link.cwd }),
+    ...(link.reviewerAuthority === undefined ? {} : { reviewerAuthority: link.reviewerAuthority }),
   };
 }
 
@@ -4575,6 +4659,7 @@ function persistedParentSubsessionLinkData(link: TrackedSubsessionLink): Record<
     spawnedSessionId: link.childSessionId,
     ...(link.childSessionFile === undefined ? {} : { spawnedSessionFile: link.childSessionFile }),
     ...(link.cwd === undefined ? {} : { cwd: link.cwd }),
+    ...(link.reviewerAuthority === undefined ? {} : { reviewerAuthority: link.reviewerAuthority }),
   };
 }
 
@@ -4595,11 +4680,46 @@ function parsePersistedParentSubsessionLink(entry: unknown): PersistedParentSubs
   if (spawnedBySessionId === undefined || spawnedBySessionId === "" || spawnedSessionId === undefined || spawnedSessionId === "") return undefined;
   const spawnedSessionFile = getString(data, "spawnedSessionFile");
   const cwd = getString(data, "cwd");
+  const reviewerAuthority = parseReviewerAuthority(data["reviewerAuthority"]);
   return {
     spawnedBySessionId,
     spawnedSessionId,
     ...(spawnedSessionFile === undefined || spawnedSessionFile === "" ? {} : { spawnedSessionFile }),
     ...(cwd === undefined || cwd === "" ? {} : { cwd }),
+    ...(reviewerAuthority === undefined ? {} : { reviewerAuthority }),
+  };
+}
+
+function parseReviewerAuthority(value: unknown): ReviewerAuthorityRecord | undefined {
+  if (!isRecord(value)) return undefined;
+  const strings = ["workId", "stableWorktreeKey", "physicalWorktree", "providerSessionId", "providerToken"];
+  if (strings.some((key) => getString(value, key) === undefined)) return undefined;
+  const workId = getString(value, "workId");
+  const stableWorktreeKey = getString(value, "stableWorktreeKey");
+  const physicalWorktree = getString(value, "physicalWorktree");
+  const providerSessionId = getString(value, "providerSessionId");
+  const providerToken = getString(value, "providerToken");
+  const routeDigest = getString(value, "routeDigest");
+  const scopeDigest = getString(value, "scopeDigest");
+  const observedTools = value["observedTools"];
+  if (workId === undefined || stableWorktreeKey === undefined || physicalWorktree === undefined || providerSessionId === undefined || providerToken === undefined || routeDigest === undefined || scopeDigest === undefined || !Array.isArray(observedTools) || !observedTools.every((tool): tool is string => typeof tool === "string")) return undefined;
+  const attempt = value["attempt"];
+  if (typeof attempt !== "number" || !Number.isInteger(attempt) || attempt < 1) return undefined;
+  const pointer = value["terminalResultPointer"];
+  if (pointer !== undefined && (!isRecord(pointer) || getString(pointer, "label") === undefined || getString(pointer, "digest") === undefined || pointer["redacted"] !== true)) return undefined;
+  if (pointer !== undefined) {
+    const label = getString(pointer, "label");
+    const digest = getString(pointer, "digest");
+    if (label === undefined || digest === undefined) return undefined;
+    return {
+      workId, attempt, routeDigest, scopeDigest, stableWorktreeKey, physicalWorktree,
+      providerSessionId, providerToken, observedTools,
+      terminalResultPointer: { label, digest, redacted: true },
+    };
+  }
+  return {
+    workId, attempt, routeDigest, scopeDigest, stableWorktreeKey, physicalWorktree,
+    providerSessionId, providerToken, observedTools,
   };
 }
 

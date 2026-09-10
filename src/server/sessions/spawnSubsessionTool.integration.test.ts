@@ -161,3 +161,46 @@ describe("yield_to_subsessions Pi agent-loop integration", () => {
     expect(result.messages.at(-1)).toMatchObject({ role: "assistant" });
   });
 });
+
+describe("reviewer result redaction at the Pi agent-loop boundary", () => {
+  it("keeps synthetic credentials out of the parent tool message and emitted UI events", async () => {
+    const secret = "SYNTH_PERSISTED_PARENT_SECRET";
+    const spawn = vi.fn(() => Promise.resolve({
+      cwd: "/workspace",
+      terminal: true,
+      terminate: true,
+      result: { terminal_outcome: "succeeded", review_content: `Authorization: Bearer ${secret}` },
+    }));
+    const deps: SubsessionToolDeps = {
+      spawn,
+      list: vi.fn(() => Promise.resolve([])),
+      check: vi.fn(() => Promise.resolve({ sessionId: "child-1", cwd: "/workspace", status: "idle" as const, finalText: "", messageCount: 0 })),
+      read: vi.fn(() => Promise.resolve({ sessionId: "child-1", cwd: "/workspace", status: "idle" as const, entries: [], total: 0, matched: 0, start: 0, hasMore: false })),
+    };
+    const definition = createSubsessionToolDefinitions("/workspace", deps).find(({ name }) => name === "spawn_subsession");
+    if (definition === undefined) throw new Error("missing spawn_subsession");
+    const streamFn = streamSequence([
+      message("toolUse", [{ type: "toolCall", id: "review-call", name: "spawn_subsession", arguments: { prompt: "review", logicalRole: "reviewer" } }]),
+    ]);
+    const events: AgentEvent[] = [];
+
+    const messages = await runAgentLoop(
+      [{ role: "user", content: "review", timestamp: 0 }],
+      { systemPrompt: "", messages: [], tools: [wrapDefinition(definition, extensionContext())] },
+      { model, convertToLlm: (agentMessages) => agentMessages.filter(isLlmMessage) },
+      (event) => { events.push(event); },
+      undefined,
+      streamFn,
+    );
+
+    const serialized = JSON.stringify({ events, messages });
+    expect(serialized).not.toContain(secret);
+    expect(serialized).toContain("Authorization: <redacted>");
+    const lastMessage = messages.at(-1);
+    if (lastMessage?.role !== "toolResult") throw new Error("expected a final tool result message");
+    const lastContent = lastMessage.content[0];
+    if (lastContent?.type !== "text") throw new Error("expected final tool text content");
+    expect(lastContent.text).toContain("Authorization: <redacted>");
+    expect(lastMessage.details).toMatchObject({ result: { review_content: "Authorization: <redacted>" } });
+  });
+});

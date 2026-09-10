@@ -16,5 +16,6 @@
     "pi-web-plugins/**/*.ts",
     "pi-packages/**/*.ts"
   ],
-  "ignoreExportsUsedInFile": true
+  "ignoreExportsUsedInFile": true,
+  "ignoreBinaries": ["ss", "ps"]
 }

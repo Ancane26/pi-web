@@ -23,6 +23,8 @@ export interface SessionServiceDependencyInput {
   catalogRefreshStatus: NonNullable<PiSessionServiceDependencies["catalogRefreshStatus"]>;
   /** Live global config reader for request-time workspace-effective defaults (e.g. the attachments save folder). */
   config: NonNullable<PiSessionServiceDependencies["config"]>;
+  /** Server-owned isolated REVIEWER bridge, constructed by sessiond at startup. */
+  reviewerBridge: NonNullable<PiSessionServiceDependencies["reviewerBridge"]>;
   /** Omitted when the operator has not enabled session spawning. */
   spawnTargets?: NonNullable<PiSessionServiceDependencies["spawnTargets"]>;
   /** The operator's subsessions preference, which also requires spawning. */
@@ -67,5 +69,6 @@ export function sessionServiceDependencies(input: SessionServiceDependencyInput)
     catalogRefreshStatus: input.catalogRefreshStatus,
     config: input.config,
     sessionManager: input.sessionManager,
+    reviewerBridge: input.reviewerBridge,
   };
 }

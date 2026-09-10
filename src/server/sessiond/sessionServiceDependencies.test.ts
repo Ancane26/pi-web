@@ -30,6 +30,10 @@ function daemonCollaborators(patch: Partial<SessionServiceDependencyInput> = {})
     askUserEnabled: true,
     appendSystemPromptSections: [],
     extensionDialogsTimeoutMs: 300_000,
+    reviewerBridge: {
+      launch: () => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true }),
+      revalidate: () => Promise.resolve(false),
+    },
     ...patch,
   };
 }
@@ -112,5 +116,14 @@ describe("sessiond session service dependency assembly", () => {
     const sections = ["<pi_web_docker_environment>\n- fact\n</pi_web_docker_environment>"];
 
     expect(sessionServiceDependencies(daemonCollaborators({ appendSystemPromptSections: sections })).appendSystemPromptSections).toEqual(sections);
+  });
+
+  it("passes the server-owned reviewer bridge through to the session service", () => {
+    const reviewerBridge = {
+      launch: () => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true }),
+      revalidate: () => Promise.resolve(false),
+    };
+
+    expect(sessionServiceDependencies(daemonCollaborators({ reviewerBridge })).reviewerBridge).toBe(reviewerBridge);
   });
 });
