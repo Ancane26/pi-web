@@ -107,6 +107,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function renderReviewerFinding(value: unknown): string {
+  if (!isRecord(value) || typeof value["severity"] !== "string" || typeof value["file"] !== "string" || typeof value["line"] !== "number" || typeof value["message"] !== "string") return "";
+  return `[${value["severity"]}] ${value["file"]}:${String(value["line"])} ${value["message"]}`;
+}
+
 const CheckSubsessionParams = Type.Object({
   sessionId: Type.String({
     description: "Tracked child id from spawn_subsession or list_subsessions.",
@@ -235,9 +240,10 @@ export function createSubsessionToolDefinitions(spawningCwd: string, deps: Subse
       const resultRecord = isRecord(safeResult.result) ? safeResult.result : undefined;
       const terminalOutcome = resultRecord?.["terminal_outcome"];
       const findings = resultRecord?.["findings"];
+      const renderedFindings = Array.isArray(findings) ? findings.map(renderReviewerFinding).filter((finding) => finding !== "") : [];
       const terminalText = safeResult.terminal === true
-        ? Array.isArray(findings) && findings.length > 0
-          ? `${findings.join("\n\n")}\n\nReviewer completed${typeof terminalOutcome === "string" ? ` with outcome ${terminalOutcome}` : ""}. Do not retry this request.`
+        ? renderedFindings.length > 0
+          ? `${renderedFindings.join("\n\n")}\n\nReviewer completed${typeof terminalOutcome === "string" ? ` with outcome ${terminalOutcome}` : ""}. Do not retry this request.`
           : `Tracked subsession ended terminally${typeof terminalOutcome === "string" ? ` with outcome ${terminalOutcome}` : ""}. Do not retry this request.`
         : undefined;
       const modelNote = safeResult.model === undefined ? "" : ` using model ${safeResult.model}`;

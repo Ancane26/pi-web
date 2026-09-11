@@ -94,6 +94,15 @@ import { plainTextTheme } from "./plainTextTheme.js";
 import { SessionUnreadStore, type SessionUnreadMutation } from "./sessionUnreadStore.js";
 import { applyEnabledModelToggle, catalogWithEnabledFirst, modelScopeId, persistedEnabledModelPatterns, resolveEnabledModelIds, resolveSessionModelOptions, scopedModelsFromEnabledIds, type EnabledModelCatalogEntry } from "./sessionModelScope.js";
 
+function reviewerResultWithCwd(bridged: ReviewerBridgeLaunchResult, cwd: string): ReviewerBridgeLaunchResult {
+  const result: ReviewerBridgeLaunchResult = { cwd, terminal: bridged.terminal, terminate: bridged.terminate };
+  if (bridged.sessionId !== undefined) result.sessionId = bridged.sessionId;
+  if (bridged.model !== undefined) result.model = bridged.model;
+  if (bridged.reviewerAuthority !== undefined) result.reviewerAuthority = bridged.reviewerAuthority;
+  if (bridged.result !== undefined) result.result = bridged.result;
+  return result;
+}
+
 /**
  * Minimal structured-logging seam, shaped like Fastify's logger so sessiond can
  * pass `app.log` directly. Defaults to a no-op so the service stays usable
@@ -1580,7 +1589,7 @@ export class PiSessionService implements SessionRouteService {
           },
         };
       }
-      if (bridged.terminal) return { ...bridged, cwd: decision.cwd };
+      if (bridged.terminal) return reviewerResultWithCwd(bridged, decision.cwd);
       if (bridged.sessionId === undefined || bridged.reviewerAuthority === undefined) {
         throw new Error("Reviewer bridge returned a non-terminal result without an authority handle");
       }
@@ -1597,7 +1606,7 @@ export class PiSessionService implements SessionRouteService {
         { parentSessionId: input.parentSessionId, sessionId: bridged.sessionId, cwd: decision.cwd, promptLength: input.prompt.length },
         "spawn_subsession started an isolated reviewer child",
       );
-      return { ...bridged, cwd: decision.cwd };
+      return reviewerResultWithCwd(bridged, decision.cwd);
     }
     // A model spec overrides the inherited model and is resolved against the
     // parent's model runtime; only a spec resolves against the parent.

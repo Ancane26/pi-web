@@ -24,11 +24,20 @@ export interface ReviewerAuthorityRecord {
 
 export type ReviewerToolName = "Read" | "Grep" | "Glob";
 export type ReviewerDenialReason = "unlisted_tool_denied" | "outside_worktree_denied" | "user_bash_denied" | "tool_execution_denied";
+export type ReviewerSeverity = "critical" | "high" | "medium" | "low" | "info";
+export type ReviewerTerminalOutcome = "succeeded" | "denied" | "failed" | "timed_out" | "cancelled" | "lost" | "cleanup_unconfirmed";
+
+export interface ReviewerFinding {
+  severity: ReviewerSeverity;
+  file: string;
+  line: number;
+  message: string;
+}
 
 export interface ReviewerResult {
   verdict: "review_complete" | "review_denied" | "review_failed";
-  findings: string[];
-  terminal_outcome: string;
+  findings: ReviewerFinding[];
+  terminal_outcome: ReviewerTerminalOutcome;
   observed_tools: ReviewerToolName[];
   denied_operations: { reason: ReviewerDenialReason; tool?: ReviewerToolName }[];
   work_id: string;
@@ -74,8 +83,15 @@ function isReviewerBridgeLaunchResult(value: unknown): value is ReviewerBridgeLa
 function isReviewerResult(value: unknown): value is ReviewerResult {
   if (!isRecord(value) || Object.keys(value).sort().join(",") !== ["denied_operations", "findings", "model", "observed_tools", "terminal_outcome", "verdict", "work_id"].join(",")) return false;
   if (value["verdict"] !== "review_complete" && value["verdict"] !== "review_denied" && value["verdict"] !== "review_failed") return false;
-  if (!Array.isArray(value["findings"]) || value["findings"].some((item) => typeof item !== "string" || item.length > 12_000)) return false;
-  if (typeof value["terminal_outcome"] !== "string" || typeof value["work_id"] !== "string" || typeof value["model"] !== "string") return false;
+  if (!Array.isArray(value["findings"]) || value["findings"].length > 50 || value["findings"].some((item) => {
+    if (!isRecord(item) || Object.keys(item).sort().join(",") !== "file,line,message,severity") return true;
+    return (item["severity"] !== "critical" && item["severity"] !== "high" && item["severity"] !== "medium" && item["severity"] !== "low" && item["severity"] !== "info")
+      || typeof item["file"] !== "string" || item["file"].trim() === "" || item["file"].startsWith("/") || item["file"].includes("\\") || item["file"].split("/").includes("..")
+      || typeof item["line"] !== "number" || !Number.isSafeInteger(item["line"]) || item["line"] < 1 || item["line"] > 1_000_000
+      || typeof item["message"] !== "string" || item["message"].trim() === "" || item["message"].length > 2_000;
+  })) return false;
+  if (value["terminal_outcome"] !== "succeeded" && value["terminal_outcome"] !== "denied" && value["terminal_outcome"] !== "failed" && value["terminal_outcome"] !== "timed_out" && value["terminal_outcome"] !== "cancelled" && value["terminal_outcome"] !== "lost" && value["terminal_outcome"] !== "cleanup_unconfirmed") return false;
+  if (typeof value["work_id"] !== "string" || typeof value["model"] !== "string") return false;
   const tools = value["observed_tools"];
   if (!Array.isArray(tools) || tools.some((tool) => tool !== "Read" && tool !== "Grep" && tool !== "Glob")) return false;
   const denials = value["denied_operations"];
@@ -103,6 +119,8 @@ function checkedResult(value: unknown): ReviewerBridgeLaunchResult {
     throw new Error("Harness reviewer bridge returned a non-object result");
   }
   const result = value;
+  const unknownKeys = Object.keys(result).filter((key) => !["sessionId", "cwd", "model", "terminal", "terminate", "reviewerAuthority", "result"].includes(key));
+  if (unknownKeys.length > 0) throw new Error(`Harness reviewer bridge returned an unrecognized top-level field: ${unknownKeys.join(",")}`);
   if (typeof result["cwd"] !== "string" || typeof result["terminal"] !== "boolean" || typeof result["terminate"] !== "boolean") {
     throw new Error("Harness reviewer bridge result omitted terminal authority fields");
   }
@@ -115,10 +133,25 @@ function checkedResult(value: unknown): ReviewerBridgeLaunchResult {
   // Defense in depth only: Python is the canonical findings sanitizer. This
   // assertion is deliberately a single narrow bearer-shaped backstop, not a
   // second recursive sanitizer implementation.
-  if (result.result?.findings.some((finding) => /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/i.test(finding)) === true) {
+  if (result.result?.findings.some((finding) => /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/i.test(finding.message)) === true) {
     throw new Error("Harness reviewer bridge returned an unsafe findings value");
   }
-  return result;
+  const checked: ReviewerBridgeLaunchResult = {
+    cwd: result.cwd,
+    terminal: result.terminal,
+    terminate: result.terminate,
+  };
+  if (result.sessionId !== undefined) {
+    if (typeof result.sessionId !== "string") throw new Error("Harness reviewer bridge sessionId must be a string");
+    checked.sessionId = result.sessionId;
+  }
+  if (result.model !== undefined) {
+    if (typeof result.model !== "string") throw new Error("Harness reviewer bridge model must be a string");
+    checked.model = result.model;
+  }
+  if (result.reviewerAuthority !== undefined) checked.reviewerAuthority = result.reviewerAuthority;
+  if (result.result !== undefined) checked.result = result.result;
+  return checked;
 }
 
 /**

@@ -16,7 +16,7 @@ const PI_WEB_PACKAGE = join(resolve(process.execPath, "../.."), "lib/node_module
 const HARNESS_ROOT = "/mnt/drive3/Claude-Workspace/repos/ai-engineering-harness-build0148-pi-web-reviewer";
 const BRIDGE_FIXTURE = join(HARNESS_ROOT, "tests/support/pi_web_bridge_fixture_entrypoint.py");
 
-function startFakeModelServer(delayMs = 0, content = "INTEGRATION REVIEW: verdict=approved; findings=none"): Promise<{ server: Server; port: number }> {
+function startFakeModelServer(delayMs = 0, content = '{"findings":[]}'): Promise<{ server: Server; port: number }> {
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -103,20 +103,18 @@ function textContent(value: unknown): string {
   return value.text;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function reviewContentOf(details: unknown): string {
-  if (
-    details === null ||
-    typeof details !== "object" ||
-    !("result" in details) ||
-    details.result === null ||
-    typeof details.result !== "object" ||
-    !("findings" in details.result) ||
-    !Array.isArray(details.result.findings) ||
-    typeof details.result.findings[0] !== "string"
-  ) {
-    throw new Error("expected details.result.findings to contain a string");
+  const result = isRecord(details) && isRecord(details["result"]) ? details["result"] : undefined;
+  const findings = result?.["findings"];
+  const finding = Array.isArray(findings) && isRecord(findings[0]) ? findings[0] : undefined;
+  if (typeof finding?.["message"] !== "string") {
+    throw new Error("expected details.result.findings to contain a message");
   }
-  return details.result.findings[0];
+  return finding["message"];
 }
 
 function hasReviewerTransportOrphans(): boolean {
@@ -153,10 +151,10 @@ describe("real harness reviewer bridge transport", () => {
       expect(result.details).toMatchObject({
         terminal: true,
         terminate: true,
-        result: { terminal_outcome: "succeeded", findings: ["INTEGRATION REVIEW: verdict=approved; findings=none"] },
+        result: { terminal_outcome: "succeeded", findings: [] },
       });
       expect(result.content[0]).toMatchObject({ type: "text" });
-      expect(textContent(result.content[0])).toContain("INTEGRATION REVIEW: verdict=approved; findings=none");
+      expect(textContent(result.content[0])).toContain("ended terminally");
       await waitForNoReviewerTransportOrphans();
     } finally {
       await service.dispose();
@@ -194,8 +192,8 @@ describe("real harness reviewer bridge transport", () => {
     const secret = "SYNTH_REAL_BRIDGE_ESCAPED_JSON";
     const { server, port } = await startFakeModelServer(
       0,
-      '{\\"Authorization\\":\\"Bearer SYNTH_REAL_BRIDGE_ESCAPED_JSON\\"}\nAuthoriz' +
-      'ation: Bearer SYNTH_REAL_BRIDGE_LABEL_SPLIT\nAuthorization: SYNTH_REAL_BRIDGE_BARE',
+      JSON.stringify({ findings: [{ severity: "high", file: "README.md", line: 1, message: '{"Authorization":"Bearer SYNTH_REAL_BRIDGE_ESCAPED_JSON"} Authoriz' +
+        'ation: Bearer SYNTH_REAL_BRIDGE_LABEL_SPLIT The key is sk-live-ABCDEFGHIJKLMNOP123456' }] }),
     );
     const ledgerRoot = mkdtempSync(join(tmpdir(), "pi-web-bridge-redaction-"));
     const service = new PiSessionService(new CapturingSessionEventHub(), {
@@ -216,6 +214,48 @@ describe("real harness reviewer bridge transport", () => {
       expect(serialized).toContain("<redacted>");
       expect(reviewContentOf(result.details)).toContain("<redacted>");
       expect(reviewContentOf(result.details)).not.toContain(secret);
+      expect(textContent(result.content[0])).toContain("<redacted>");
+    } finally {
+      await service.dispose();
+      await closeServer(server);
+      rmSync(ledgerRoot, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it("keeps every unlabeled credential shape out of the real bridge result", async () => {
+    const slackCredential = ["xox", "b-123456789012-123456789012-abcdefghijklmnopqrstuv"].join("");
+    const { server, port } = await startFakeModelServer(
+      0,
+      JSON.stringify({ findings: [
+        { severity: "high", file: "README.md", line: 1, message: "The key is sk-live-ABCDEFGHIJKLMNOP123456" },
+        { severity: "high", file: "README.md", line: 1, message: "Use ghp_1234567890abcdefABCDEF1234567890" },
+        { severity: "critical", file: "README.md", line: 1, message: "AWS key AKIAIOSFODNN7EXAMPLE" },
+        { severity: "high", file: "README.md", line: 1, message: `Slack ${slackCredential}` },
+        { severity: "critical", file: "README.md", line: 1, message: "-----BEGIN RSA PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n-----END RSA PRIVATE KEY-----" },
+        { severity: "high", file: "README.md", line: 1, message: "opaque QWxhZGRpbjpPcGVuU2VzYW1lMTIzNDU2Nzg5MGFiY2RlZg==" },
+        { severity: "high", file: "README.md", line: 1, message: "Autho\\u200brization: Bearer SYNTH_INTRA_LABEL" },
+      ] }),
+    );
+    const ledgerRoot = mkdtempSync(join(tmpdir(), "pi-web-bridge-shapes-"));
+    const service = new PiSessionService(new CapturingSessionEventHub(), {
+      agentDir: join(ledgerRoot, "agent"),
+      modelRuntime: testModelRuntime,
+      sessionManager: sessionGateway([]),
+      archiveStore: emptyArchiveStore(),
+      spawnTargets: { resolveSpawnTarget: () => Promise.resolve({ allowed: true, cwd: "/workspace" }) },
+      reviewerBridge: new ExecFileHarnessReviewerBridge(reviewerBridgeOptions(ledgerRoot, port)),
+      heartbeatIntervalMs: 60_000,
+    });
+    try {
+      const result = await toolFor(service).execute("shape-call", { prompt: "review", logicalRole: "reviewer" }, undefined, undefined, context());
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain("sk-live-");
+      expect(serialized).not.toContain("ghp_");
+      expect(serialized).not.toContain("AKIA");
+      expect(serialized).not.toContain(["xox", "b-"].join(""));
+      expect(serialized).not.toContain("PRIVATE KEY");
+      expect(serialized).not.toContain("QWxhZGR");
+      expect(serialized).not.toContain("SYNTH_INTRA_LABEL");
       expect(textContent(result.content[0])).toContain("<redacted>");
     } finally {
       await service.dispose();

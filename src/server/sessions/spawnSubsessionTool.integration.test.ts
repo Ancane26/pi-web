@@ -171,7 +171,7 @@ describe("reviewer result redaction at the Pi agent-loop boundary", () => {
       terminate: true,
     result: {
       verdict: "review_complete",
-      findings: ["Authorization: <redacted>"],
+      findings: [{ severity: "high", file: "review-fixture.txt", line: 1, message: "Authorization: <redacted>" }],
       terminal_outcome: "succeeded",
       observed_tools: ["Read"],
       denied_operations: [],
@@ -209,6 +209,6 @@ describe("reviewer result redaction at the Pi agent-loop boundary", () => {
     const lastContent = lastMessage.content[0];
     if (lastContent?.type !== "text") throw new Error("expected final tool text content");
     expect(lastContent.text).toContain("Authorization: <redacted>");
-    expect(lastMessage.details).toMatchObject({ result: { findings: ["Authorization: <redacted>"] } });
+    expect(lastMessage.details).toMatchObject({ result: { findings: [{ message: "Authorization: <redacted>" }] } });
   });
 });

@@ -95,7 +95,7 @@ describe("harness reviewer bridge boundary", () => {
             model: "llama-server-9b/qwen3.5-9b:latest",
             verdict: "review_denied" as const,
             findings: [],
-            terminal_outcome: "denied",
+            terminal_outcome: "denied" as const,
             observed_tools: [],
             denied_operations: [{ reason: "unlisted_tool_denied" as const }],
           },
@@ -138,6 +138,14 @@ describe("harness reviewer bridge boundary", () => {
     });
   });
 
+  it("rejects an unrecognized top-level bridge envelope key", async () => {
+    const payload = JSON.stringify({ cwd: "/workspace", terminal: true, terminate: true, injected: "SYNTH_EXTRA_BRIDGE_KEY" });
+    const bridge = new ExecFileHarnessReviewerBridge({ command: "/bin/sh", args: ["-c", "printf '%s\\n' \"$1\"", "bridge", payload] });
+    await expect(bridge.launch({ parentSessionId: "parent-1", parentSessionFile: "/sessions/parent-1.jsonl", prompt: "review" })).rejects.toThrow(
+      "unrecognized top-level field",
+    );
+  });
+
   it("does not expose rejected-child stderr diagnostics", async () => {
     const secret = "SYNTH_TRANSPORT_FAILURE_SECRET";
     const bridge = new ExecFileHarnessReviewerBridge({
@@ -164,7 +172,7 @@ describe("harness reviewer bridge boundary", () => {
       terminate: true,
       result: {
         verdict: "review_complete",
-        findings: ["Authorization: <redacted>"],
+        findings: [{ severity: "high", file: "review-fixture.txt", line: 1, message: "Authorization: <redacted>" }],
         terminal_outcome: "succeeded",
         observed_tools: ["Read"],
         denied_operations: [],
@@ -198,7 +206,7 @@ describe("harness reviewer bridge boundary", () => {
 
       expect(serialized).not.toContain(secret);
       expect(serialized).toContain("Authorization: <redacted>");
-      expect(result.details).toMatchObject({ result: { findings: ["Authorization: <redacted>"] } });
+      expect(result.details).toMatchObject({ result: { findings: [{ message: "Authorization: <redacted>" }] } });
       expect(textContent(result.content[0])).toContain("Authorization: <redacted>");
     } finally {
       await service.dispose();
