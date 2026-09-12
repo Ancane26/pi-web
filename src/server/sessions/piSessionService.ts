@@ -81,7 +81,7 @@ import { ExtensionDialogWaiters, effectiveExtensionDialogTimeoutMs, extensionDia
 import { DEFAULT_EXTENSION_DIALOGS_TIMEOUT_MS } from "../../config.js";
 import { createSpawnSessionToolDefinition, type SpawnSessionInvocation, type SpawnSessionResult } from "./spawnSessionTool.js";
 import { createSubsessionToolDefinitions, type SpawnSubsessionInvocation, type SpawnSubsessionResult, type SubsessionCheckResult, type SubsessionReadQuery, type SubsessionReadResult, type SubsessionStatus, type SubsessionSummary, type SubsessionToolDeps } from "./spawnSubsessionTool.js";
-import type { HarnessReviewerBridge, ReviewerAuthorityRecord, ReviewerBridgeLaunchResult } from "./harnessReviewerBridge.js";
+import type { HarnessReviewerBridge, ReviewerAuthorityRecord, ReviewerBridgeLaunchResult, ReviewerResult, ReviewerTerminalOutcome } from "./harnessReviewerBridge.js";
 import { buildTranscriptView } from "./subsessionTranscript.js";
 import { planSessionCleanup, summarizeSessionCleanupExecution, type NormalizedSessionCleanupRequest, type SessionCleanupPlan } from "./sessionCleanup.js";
 import type { SpawnTargetDecision, SpawnTargetResolver } from "./spawnTargetResolver.js";
@@ -93,6 +93,15 @@ import {
 import { plainTextTheme } from "./plainTextTheme.js";
 import { SessionUnreadStore, type SessionUnreadMutation } from "./sessionUnreadStore.js";
 import { applyEnabledModelToggle, catalogWithEnabledFirst, modelScopeId, persistedEnabledModelPatterns, resolveEnabledModelIds, resolveSessionModelOptions, scopedModelsFromEnabledIds, type EnabledModelCatalogEntry } from "./sessionModelScope.js";
+
+function reviewerStatusFromOutcome(outcome: ReviewerTerminalOutcome | undefined): SubsessionStatus {
+  if (outcome === undefined) return "unknown";
+  return outcome === "succeeded" ? "idle" : "error";
+}
+
+function reviewerFinalText(result: ReviewerResult): string {
+  return JSON.stringify({ verdict: result.verdict, findings: result.findings });
+}
 
 function reviewerResultWithCwd(bridged: ReviewerBridgeLaunchResult, cwd: string): ReviewerBridgeLaunchResult {
   const result: ReviewerBridgeLaunchResult = { cwd, terminal: bridged.terminal, terminate: bridged.terminate };
@@ -255,6 +264,11 @@ interface TrackedSubsessionLink {
   parentSessionFile?: string;
   cwd?: string;
   reviewerAuthority?: ReviewerAuthorityRecord;
+  /** In-memory cache of the reviewer's terminal result, once observed via
+   * reviewerBridge.status(). Avoids re-polling (and re-running cleanup for)
+   * an authority that has already finished. Never persisted -- a restart
+   * re-derives this the same way, by polling status() again. */
+  reviewerResult?: ReviewerResult;
 }
 
 interface PersistedParentSubsessionLink {
@@ -2016,7 +2030,9 @@ export class PiSessionService implements SessionRouteService {
 
   /** Status and final result of a subsession, scoped to the caller's children. */
   async checkSubsession(parentSessionId: string, sessionId: string, parentSessionFile?: string): Promise<SubsessionCheckResult> {
-    const session = await this.openSubsession(parentSessionId, sessionId, parentSessionFile);
+    const link = await this.authorizeSubsessionLink(parentSessionId, sessionId, parentSessionFile);
+    if (link.reviewerAuthority !== undefined) return this.checkReviewerSubsession(link);
+    const session = await this.getOrOpenTrackedSubsession(sessionId);
     const messages = historyMessages(session);
     return {
       sessionId,
@@ -2029,7 +2045,9 @@ export class PiSessionService implements SessionRouteService {
 
   /** Filtered, paginated transcript of a subsession, scoped to the caller's children. */
   async readSubsession(parentSessionId: string, sessionId: string, query: SubsessionReadQuery, parentSessionFile?: string): Promise<SubsessionReadResult> {
-    const session = await this.openSubsession(parentSessionId, sessionId, parentSessionFile);
+    const link = await this.authorizeSubsessionLink(parentSessionId, sessionId, parentSessionFile);
+    if (link.reviewerAuthority !== undefined) return this.readReviewerSubsession(link, query);
+    const session = await this.getOrOpenTrackedSubsession(sessionId);
     const view = buildTranscriptView(historyMessages(session), query);
     return {
       sessionId,
@@ -2039,14 +2057,54 @@ export class PiSessionService implements SessionRouteService {
     };
   }
 
-  /** Open a session after verifying it is one of the caller's tracked children. */
-  private async openSubsession(parentSessionId: string, sessionId: string, parentSessionFile?: string): Promise<PiAgentSession> {
+  /** Verify a session is one of the caller's tracked children and return its link. */
+  private async authorizeSubsessionLink(parentSessionId: string, sessionId: string, parentSessionFile?: string): Promise<TrackedSubsessionLink> {
     const parentFile = nonEmptyString(parentSessionFile);
     await this.hydrateSubsessionsForParent(parentSessionId, parentFile);
     if (this.subsessionParents.get(sessionId) !== parentSessionId || !this.subsessionLinkBelongsToParent(parentSessionId, parentFile, sessionId)) {
       throw new Error(`Session ${sessionId} is not one of your subsessions`);
     }
-    return this.getOrOpenTrackedSubsession(sessionId);
+    const link = this.subsessionLinks.get(sessionId);
+    if (link === undefined) throw new Error("Session not found");
+    return link;
+  }
+
+  /** Single non-blocking status check against a reviewer's external authority,
+   * cached in-memory once the reviewer reaches a terminal outcome so a later
+   * check/read does not re-invoke the bridge (and does not re-run cleanup). */
+  private async pollReviewerAuthority(link: TrackedSubsessionLink): Promise<{ status: SubsessionStatus; result?: ReviewerResult }> {
+    if (link.reviewerResult !== undefined) {
+      return { status: reviewerStatusFromOutcome(link.reviewerResult.terminal_outcome), result: link.reviewerResult };
+    }
+    if (this.reviewerBridge === undefined || link.reviewerAuthority === undefined) return { status: "error" };
+    let bridged: ReviewerBridgeLaunchResult;
+    try {
+      bridged = await this.reviewerBridge.status(link.reviewerAuthority);
+    } catch {
+      return { status: "error" };
+    }
+    if (!bridged.terminal) return { status: "working" };
+    if (bridged.result === undefined) return { status: reviewerStatusFromOutcome(undefined) };
+    link.reviewerResult = bridged.result;
+    return { status: reviewerStatusFromOutcome(bridged.result.terminal_outcome), result: bridged.result };
+  }
+
+  private async checkReviewerSubsession(link: TrackedSubsessionLink): Promise<SubsessionCheckResult> {
+    const { status, result } = await this.pollReviewerAuthority(link);
+    return {
+      sessionId: link.childSessionId,
+      cwd: link.cwd ?? "",
+      status,
+      finalText: result === undefined ? "" : reviewerFinalText(result),
+      messageCount: result === undefined ? 0 : 1,
+    };
+  }
+
+  private async readReviewerSubsession(link: TrackedSubsessionLink, query: SubsessionReadQuery): Promise<SubsessionReadResult> {
+    const { status, result } = await this.pollReviewerAuthority(link);
+    const messages = result === undefined ? [] : [{ role: "assistant", content: reviewerFinalText(result) }];
+    const view = buildTranscriptView(messages, query);
+    return { sessionId: link.childSessionId, cwd: link.cwd ?? "", status, ...view };
   }
 
   private subsessionLinkBelongsToParent(parentSessionId: string, parentSessionFile: string | undefined, childSessionId: string): boolean {
@@ -2235,9 +2293,11 @@ export class PiSessionService implements SessionRouteService {
     if (active !== undefined) return active.runtime.session;
 
     if (link.reviewerAuthority !== undefined) {
-      if (this.reviewerBridge === undefined || !(await this.reviewerBridge.revalidate(link.reviewerAuthority))) {
-        throw new Error("Reviewer authority could not be revalidated");
-      }
+      // Reviewer children are an external authority, not a generic Pi
+      // session, so there is no PiAgentSession to return here -- callers
+      // that need a reviewer's status/result use pollReviewerAuthority()
+      // directly (see checkReviewerSubsession/readReviewerSubsession),
+      // which branch before ever reaching getOrOpenTrackedSubsession.
       throw new Error("Reviewer child is an external authority session and has no generic Pi session file");
     }
 
@@ -2252,6 +2312,10 @@ export class PiSessionService implements SessionRouteService {
 
   private async subsessionSummaryFields(childSessionId: string): Promise<{ cwd: string; status: SubsessionStatus }> {
     const link = this.subsessionLinks.get(childSessionId);
+    if (link?.reviewerAuthority !== undefined) {
+      const { status } = await this.pollReviewerAuthority(link);
+      return { cwd: link.cwd ?? "", status };
+    }
     const active = link === undefined ? undefined : this.activeChildForSubsessionLink(link);
     if (active !== undefined) {
       return { cwd: active.runtime.cwd, status: this.subsessionStatus(active.runtime.session) };

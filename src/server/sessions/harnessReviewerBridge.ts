@@ -57,6 +57,11 @@ export interface ReviewerBridgeLaunchResult {
 export interface HarnessReviewerBridge {
   launch(input: ReviewerBridgeLaunchInput): Promise<ReviewerBridgeLaunchResult>;
   revalidate(authority: ReviewerAuthorityRecord): Promise<boolean>;
+  /** Single non-blocking status check against an in-progress reviewer authority.
+   * Returns the same shape as launch(): terminal:false while still running,
+   * terminal:true with the final result once the reviewer finishes. Never
+   * blocks waiting for completion -- the caller polls this again later. */
+  status(authority: ReviewerAuthorityRecord, signal?: AbortSignal): Promise<ReviewerBridgeLaunchResult>;
 }
 
 export interface HarnessReviewerBridgeOptions {
@@ -176,6 +181,10 @@ export class ExecFileHarnessReviewerBridge implements HarnessReviewerBridge {
 
   revalidate(authority: ReviewerAuthorityRecord): Promise<boolean> {
     return this.invoke({ operation: "revalidate", reviewerAuthority: authority }).then((result) => result.terminal && !result.terminate);
+  }
+
+  status(authority: ReviewerAuthorityRecord, signal?: AbortSignal): Promise<ReviewerBridgeLaunchResult> {
+    return this.invoke({ operation: "status", reviewerAuthority: authority }, signal);
   }
 
   private invoke(payload: Record<string, unknown>, signal?: AbortSignal): Promise<ReviewerBridgeLaunchResult> {

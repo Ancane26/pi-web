@@ -102,6 +102,7 @@ describe("harness reviewer bridge boundary", () => {
         });
       }),
       revalidate: vi.fn(() => Promise.resolve(false)),
+      status: vi.fn(() => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true })),
     };
     const service = new PiSessionService(new CapturingSessionEventHub(), {
       agentDir: "/tmp/pi-web-test-agent",

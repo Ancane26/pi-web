@@ -107,14 +107,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function reviewContentOf(details: unknown): string {
-  const result = isRecord(details) && isRecord(details["result"]) ? details["result"] : undefined;
-  const findings = result?.["findings"];
-  const finding = Array.isArray(findings) && isRecord(findings[0]) ? findings[0] : undefined;
-  if (typeof finding?.["message"] !== "string") {
-    throw new Error("expected details.result.findings to contain a message");
+function reviewerSessionIdOf(details: unknown): string {
+  const sessionId = isRecord(details) ? details["sessionId"] : undefined;
+  if (typeof sessionId !== "string") throw new Error("expected a reviewer sessionId in the non-terminal spawn result");
+  return sessionId;
+}
+
+/** Polls the real, production check_subsession path (PiSessionService.checkSubsession,
+ * which now calls reviewerBridge.status() under the hood) until the reviewer authority
+ * reaches a terminal outcome. This is the actual live proof the redesign is for: the
+ * reviewer keeps running in the background after spawn_subsession already returned. */
+async function waitForReviewerTerminalStatus(service: PiSessionService, parentSessionId: string, sessionId: string, timeoutMs = 150_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const check = await service.checkSubsession(parentSessionId, sessionId);
+    if (check.status !== "working") return check;
+    if (Date.now() > deadline) throw new Error("reviewer subsession did not reach a terminal status in time");
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
   }
-  return finding["message"];
 }
 
 function hasReviewerTransportOrphans(): boolean {
@@ -132,7 +142,7 @@ async function waitForNoReviewerTransportOrphans(): Promise<void> {
 }
 
 describe("real harness reviewer bridge transport", () => {
-  it("launches the real Python bridge through ExecFile with real args/env and returns review content", async () => {
+  it("returns from spawn_subsession almost immediately, then reports the finished review via status polling", async () => {
     const { server, port } = await startFakeModelServer();
     const ledgerRoot = mkdtempSync(join(tmpdir(), "pi-web-bridge-ledger-"));
     const options = reviewerBridgeOptions(ledgerRoot, port);
@@ -146,15 +156,25 @@ describe("real harness reviewer bridge transport", () => {
       heartbeatIntervalMs: 60_000,
     });
     try {
+      const startedAt = Date.now();
       const result = await toolFor(service).execute("integration-call", { prompt: "review the fixture", logicalRole: "reviewer" }, undefined, undefined, context());
-      expect(result.terminate).toBe(true);
-      expect(result.details).toMatchObject({
-        terminal: true,
-        terminate: true,
-        result: { terminal_outcome: "succeeded", findings: [] },
-      });
-      expect(result.content[0]).toMatchObject({ type: "text" });
-      expect(textContent(result.content[0])).toContain("ended terminally");
+      const spawnElapsedMs = Date.now() - startedAt;
+      // The point of this redesign: spawn_subsession must not block for the
+      // reviewer's own full run time. A regression back to launch() awaiting
+      // the result synchronously would make this comparable to (or slower
+      // than) the reviewer's real completion time, well past this bound.
+      expect(spawnElapsedMs).toBeLessThan(10_000);
+      // The agent loop only reads a top-level terminate:true to stop the
+      // turn (see spawnSubsessionTool.ts); a non-terminal result omits the
+      // field entirely rather than sending terminate:false.
+      expect(result.terminate).not.toBe(true);
+      expect(result.details).toMatchObject({ terminal: false, terminate: false });
+      expect(textContent(result.content[0])).toContain("do not poll");
+
+      const sessionId = reviewerSessionIdOf(result.details);
+      const check = await waitForReviewerTerminalStatus(service, "integration-parent", sessionId);
+      expect(check.status).toBe("idle");
+      expect(check.finalText).toContain("review_complete");
       await waitForNoReviewerTransportOrphans();
     } finally {
       await service.dispose();
@@ -207,14 +227,19 @@ describe("real harness reviewer bridge transport", () => {
     });
     try {
       const result = await toolFor(service).execute("redaction-call", { prompt: "review the adversarial fixture", logicalRole: "reviewer" }, undefined, undefined, context());
-      const serialized = JSON.stringify(result);
+      const spawnSerialized = JSON.stringify(result);
+      expect(spawnSerialized).not.toContain(secret);
+      expect(spawnSerialized).not.toContain("SYNTH_REAL_BRIDGE_");
+
+      const sessionId = reviewerSessionIdOf(result.details);
+      const check = await waitForReviewerTerminalStatus(service, "integration-parent", sessionId);
+      const serialized = JSON.stringify(check);
 
       expect(serialized).not.toContain(secret);
       expect(serialized).not.toContain("SYNTH_REAL_BRIDGE_");
       expect(serialized).toContain("<redacted>");
-      expect(reviewContentOf(result.details)).toContain("<redacted>");
-      expect(reviewContentOf(result.details)).not.toContain(secret);
-      expect(textContent(result.content[0])).toContain("<redacted>");
+      expect(check.finalText).toContain("<redacted>");
+      expect(check.finalText).not.toContain(secret);
     } finally {
       await service.dispose();
       await closeServer(server);
@@ -248,7 +273,9 @@ describe("real harness reviewer bridge transport", () => {
     });
     try {
       const result = await toolFor(service).execute("shape-call", { prompt: "review", logicalRole: "reviewer" }, undefined, undefined, context());
-      const serialized = JSON.stringify(result);
+      const sessionId = reviewerSessionIdOf(result.details);
+      const check = await waitForReviewerTerminalStatus(service, "integration-parent", sessionId);
+      const serialized = JSON.stringify(check);
       expect(serialized).not.toContain("sk-live-");
       expect(serialized).not.toContain("ghp_");
       expect(serialized).not.toContain("AKIA");
@@ -256,7 +283,7 @@ describe("real harness reviewer bridge transport", () => {
       expect(serialized).not.toContain("PRIVATE KEY");
       expect(serialized).not.toContain("QWxhZGR");
       expect(serialized).not.toContain("SYNTH_INTRA_LABEL");
-      expect(textContent(result.content[0])).toContain("<redacted>");
+      expect(check.finalText).toContain("<redacted>");
     } finally {
       await service.dispose();
       await closeServer(server);

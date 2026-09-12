@@ -33,6 +33,7 @@ function daemonCollaborators(patch: Partial<SessionServiceDependencyInput> = {})
     reviewerBridge: {
       launch: () => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true }),
       revalidate: () => Promise.resolve(false),
+      status: () => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true }),
     },
     ...patch,
   };
@@ -122,6 +123,7 @@ describe("sessiond session service dependency assembly", () => {
     const reviewerBridge = {
       launch: () => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true }),
       revalidate: () => Promise.resolve(false),
+      status: () => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true }),
     };
 
     expect(sessionServiceDependencies(daemonCollaborators({ reviewerBridge })).reviewerBridge).toBe(reviewerBridge);
