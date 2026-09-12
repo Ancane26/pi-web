@@ -1,0 +1,344 @@
+import { createServer, type Server } from "node:http";
+import { execFileSync } from "node:child_process";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { describe, expect, it } from "vitest";
+import { createReviewerBridgeOptions } from "../sessiond/reviewerBridgeConfig.js";
+import { ExecFileHarnessReviewerBridge } from "./harnessReviewerBridge.js";
+import { PiSessionService } from "./piSessionService.js";
+import { CapturingSessionEventHub, emptyArchiveStore, sessionGateway, testModelRuntime } from "./piSessionService.testSupport.js";
+import { createSubsessionToolDefinitions, type SubsessionToolDeps } from "./spawnSubsessionTool.js";
+
+const PI_WEB_ROOT = resolve(process.cwd());
+const PI_WEB_PACKAGE = join(resolve(process.execPath, "../.."), "lib/node_modules/@jmfederico/pi-web/package.json");
+const HARNESS_ROOT = "/mnt/drive3/Claude-Workspace/repos/ai-engineering-harness-build0148-pi-web-reviewer";
+const BRIDGE_FIXTURE = join(HARNESS_ROOT, "tests/support/pi_web_bridge_fixture_entrypoint.py");
+
+function startFakeModelServer(delayMs = 0, content = '{"findings":[]}'): Promise<{ server: Server; port: number }> {
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      if (!isStreamBody(parsed)) {
+        response.destroy(new Error("invalid fake model request"));
+        return;
+      }
+      const body: { stream?: boolean } = parsed;
+      const payload = body.stream === true
+        ? `data: ${JSON.stringify({ choices: [{ delta: { role: "assistant", content }, finish_reason: null }] })}\n\ndata: [DONE]\n\n`
+        : JSON.stringify({ choices: [{ message: { role: "assistant", content }, finish_reason: "stop" }] });
+      const send = () => {
+        if (response.destroyed) return;
+        response.writeHead(200, { "Content-Type": body.stream === true ? "text/event-stream" : "application/json" });
+        response.end(payload);
+      };
+      if (delayMs > 0) setTimeout(send, delayMs);
+      else send();
+    });
+  });
+  return new Promise((resolvePromise, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        reject(new Error("fake model server did not expose a TCP port"));
+        return;
+      }
+      resolvePromise({ server, port: address.port });
+    });
+  });
+}
+
+function isStreamBody(value: unknown): value is { stream?: boolean } {
+  return value !== null && typeof value === "object" && !Array.isArray(value) && "stream" in value && (value.stream === undefined || typeof value.stream === "boolean");
+}
+
+function closeServer(server: Server): Promise<void> {
+  server.closeAllConnections();
+  return new Promise((resolvePromise) => server.close(() => { resolvePromise(); }));
+}
+
+function reviewerBridgeOptions(ledgerRoot: string, upstreamPort: number, timeoutMs = 120_000) {
+  return createReviewerBridgeOptions({
+    ...process.env,
+    PI_WEB_REVIEWER_HARNESS_ROOT: HARNESS_ROOT,
+    PI_WEB_REVIEWER_REPOSITORY_ROOT: HARNESS_ROOT,
+    PI_WEB_REVIEWER_LEDGER_ROOT: ledgerRoot,
+    PI_WEB_REVIEWER_PI_WEB_PACKAGE_JSON: PI_WEB_PACKAGE,
+    PI_WEB_REVIEWER_BRIDGE_COMMAND: "/usr/bin/python3",
+    PI_WEB_REVIEWER_BRIDGE_ARGS: JSON.stringify([BRIDGE_FIXTURE]),
+    PI_WEB_REVIEWER_NODE_BINARY: process.execPath,
+    PI_WEB_REVIEWER_BWRAP: "/usr/bin/bwrap",
+    PI_WEB_REVIEWER_SOURCE_BIN_DIR: join(homedir(), ".pi/agent/bin"),
+    PI_WEB_REVIEWER_UPSTREAM_PORT: String(upstreamPort),
+    PI_WEB_REVIEWER_BRIDGE_TIMEOUT_MS: String(timeoutMs),
+  }, PI_WEB_ROOT);
+}
+
+function toolFor(service: PiSessionService) {
+  const deps: SubsessionToolDeps = {
+    spawn: (input) => service.spawnSubsession(input),
+    list: () => Promise.resolve([]),
+    check: () => Promise.resolve({ sessionId: "unused", cwd: "/workspace", status: "unknown" as const, finalText: "", messageCount: 0 }),
+    read: () => Promise.resolve({ sessionId: "unused", cwd: "/workspace", status: "unknown" as const, entries: [], total: 0, matched: 0, start: 0, hasMore: false }),
+  };
+  const tool = createSubsessionToolDefinitions("/workspace", deps).find((item) => item.name === "spawn_subsession");
+  if (tool === undefined) throw new Error("spawn_subsession tool missing");
+  return tool;
+}
+
+function context(): ExtensionContext {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- minimal integration boundary for a Pi tool definition.
+  return {
+    sessionManager: { getSessionId: () => "integration-parent", getSessionFile: () => undefined },
+    model: { provider: "fixture", id: "fixture" },
+  } as unknown as ExtensionContext;
+}
+
+function textContent(value: unknown): string {
+  if (value === null || typeof value !== "object" || !("type" in value) || value.type !== "text" || !("text" in value) || typeof value.text !== "string") throw new Error("expected text tool content");
+  return value.text;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function reviewerSessionIdOf(details: unknown): string {
+  const sessionId = isRecord(details) ? details["sessionId"] : undefined;
+  if (typeof sessionId !== "string") throw new Error("expected a reviewer sessionId in the non-terminal spawn result");
+  return sessionId;
+}
+
+/** Polls the real, production check_subsession path (PiSessionService.checkSubsession,
+ * which now calls reviewerBridge.status() under the hood) until the reviewer authority
+ * reaches a terminal outcome. This is the actual live proof the redesign is for: the
+ * reviewer keeps running in the background after spawn_subsession already returned. */
+async function waitForReviewerTerminalStatus(service: PiSessionService, parentSessionId: string, sessionId: string, timeoutMs = 150_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const check = await service.checkSubsession(parentSessionId, sessionId);
+    if (check.status !== "working") return check;
+    if (Date.now() > deadline) throw new Error("reviewer subsession did not reach a terminal status in time");
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
+  }
+}
+
+function hasReviewerTransportOrphans(): boolean {
+  const sockets = execFileSync("ss", ["-xlpn"], { encoding: "utf8" });
+  const processes = execFileSync("ps", ["-eo", "args="], { encoding: "utf8" });
+  return sockets.includes("piw-reviewer-") || processes.includes("model_loopback_proxy.mjs");
+}
+
+async function waitForNoReviewerTransportOrphans(): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!hasReviewerTransportOrphans()) return;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+  }
+  throw new Error("reviewer bridge left a proxy process or socket listener behind");
+}
+
+describe("real harness reviewer bridge transport", () => {
+  it("returns from spawn_subsession almost immediately, then reports the finished review via status polling", async () => {
+    const { server, port } = await startFakeModelServer();
+    const ledgerRoot = mkdtempSync(join(tmpdir(), "pi-web-bridge-ledger-"));
+    const options = reviewerBridgeOptions(ledgerRoot, port);
+    const service = new PiSessionService(new CapturingSessionEventHub(), {
+      agentDir: join(ledgerRoot, "agent"),
+      modelRuntime: testModelRuntime,
+      sessionManager: sessionGateway([]),
+      archiveStore: emptyArchiveStore(),
+      spawnTargets: { resolveSpawnTarget: () => Promise.resolve({ allowed: true, cwd: "/workspace" }) },
+      reviewerBridge: new ExecFileHarnessReviewerBridge(options),
+      heartbeatIntervalMs: 60_000,
+    });
+    try {
+      const startedAt = Date.now();
+      const result = await toolFor(service).execute("integration-call", { prompt: "review the fixture", logicalRole: "reviewer" }, undefined, undefined, context());
+      const spawnElapsedMs = Date.now() - startedAt;
+      // The point of this redesign: spawn_subsession must not block for the
+      // reviewer's own full run time. A regression back to launch() awaiting
+      // the result synchronously would make this comparable to (or slower
+      // than) the reviewer's real completion time, well past this bound.
+      expect(spawnElapsedMs).toBeLessThan(10_000);
+      // The agent loop only reads a top-level terminate:true to stop the
+      // turn (see spawnSubsessionTool.ts); a non-terminal result omits the
+      // field entirely rather than sending terminate:false.
+      expect(result.terminate).not.toBe(true);
+      expect(result.details).toMatchObject({ terminal: false, terminate: false });
+      expect(textContent(result.content[0])).toContain("do not poll");
+
+      const sessionId = reviewerSessionIdOf(result.details);
+      const check = await waitForReviewerTerminalStatus(service, "integration-parent", sessionId);
+      expect(check.status).toBe("idle");
+      expect(check.finalText).toContain("review_complete");
+      await waitForNoReviewerTransportOrphans();
+    } finally {
+      await service.dispose();
+      await closeServer(server);
+      rmSync(ledgerRoot, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it("turns a real ENOENT bridge spawn into one terminal top-level result", async () => {
+    const service = new PiSessionService(new CapturingSessionEventHub(), {
+      agentDir: "/tmp/pi-web-bridge-unavailable-agent",
+      modelRuntime: testModelRuntime,
+      sessionManager: sessionGateway([]),
+      archiveStore: emptyArchiveStore(),
+      spawnTargets: { resolveSpawnTarget: () => Promise.resolve({ allowed: true, cwd: "/workspace" }) },
+      reviewerBridge: new ExecFileHarnessReviewerBridge({ command: "/definitely/missing/pi-web-reviewer-bridge", timeoutMs: 2_000 }),
+      heartbeatIntervalMs: 60_000,
+    });
+    try {
+      const result = await toolFor(service).execute("enoent-call", { prompt: "review", logicalRole: "reviewer" }, undefined, undefined, context());
+      expect(result.terminate).toBe(true);
+      expect(result.details).toMatchObject({
+        terminal: true,
+        terminate: true,
+        result: { verdict: "review_denied", terminal_outcome: "denied", findings: [], model: "unavailable" },
+      });
+      expect(textContent(result.content[0])).toContain("Do not retry this request.");
+      expect(textContent(result.content[0])).not.toContain("ENOENT");
+    } finally {
+      await service.dispose();
+    }
+  });
+
+  it("keeps adversarial sentinels out of the real bridge, tool content, and details", async () => {
+    const secret = "SYNTH_REAL_BRIDGE_ESCAPED_JSON";
+    const { server, port } = await startFakeModelServer(
+      0,
+      JSON.stringify({ findings: [{ severity: "high", file: "README.md", line: 1, message: '{"Authorization":"Bearer SYNTH_REAL_BRIDGE_ESCAPED_JSON"} Authoriz' +
+        'ation: Bearer SYNTH_REAL_BRIDGE_LABEL_SPLIT The key is sk-live-ABCDEFGHIJKLMNOP123456' }] }),
+    );
+    const ledgerRoot = mkdtempSync(join(tmpdir(), "pi-web-bridge-redaction-"));
+    const service = new PiSessionService(new CapturingSessionEventHub(), {
+      agentDir: join(ledgerRoot, "agent"),
+      modelRuntime: testModelRuntime,
+      sessionManager: sessionGateway([]),
+      archiveStore: emptyArchiveStore(),
+      spawnTargets: { resolveSpawnTarget: () => Promise.resolve({ allowed: true, cwd: "/workspace" }) },
+      reviewerBridge: new ExecFileHarnessReviewerBridge(reviewerBridgeOptions(ledgerRoot, port)),
+      heartbeatIntervalMs: 60_000,
+    });
+    try {
+      const result = await toolFor(service).execute("redaction-call", { prompt: "review the adversarial fixture", logicalRole: "reviewer" }, undefined, undefined, context());
+      const spawnSerialized = JSON.stringify(result);
+      expect(spawnSerialized).not.toContain(secret);
+      expect(spawnSerialized).not.toContain("SYNTH_REAL_BRIDGE_");
+
+      const sessionId = reviewerSessionIdOf(result.details);
+      const check = await waitForReviewerTerminalStatus(service, "integration-parent", sessionId);
+      const serialized = JSON.stringify(check);
+
+      expect(serialized).not.toContain(secret);
+      expect(serialized).not.toContain("SYNTH_REAL_BRIDGE_");
+      expect(serialized).toContain("<redacted>");
+      expect(check.finalText).toContain("<redacted>");
+      expect(check.finalText).not.toContain(secret);
+    } finally {
+      await service.dispose();
+      await closeServer(server);
+      rmSync(ledgerRoot, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it("keeps every unlabeled credential shape out of the real bridge result", async () => {
+    const slackCredential = ["xox", "b-123456789012-123456789012-abcdefghijklmnopqrstuv"].join("");
+    const { server, port } = await startFakeModelServer(
+      0,
+      JSON.stringify({ findings: [
+        { severity: "high", file: "README.md", line: 1, message: "The key is sk-live-ABCDEFGHIJKLMNOP123456" },
+        { severity: "high", file: "README.md", line: 1, message: "Use ghp_1234567890abcdefABCDEF1234567890" },
+        { severity: "critical", file: "README.md", line: 1, message: "AWS key AKIAIOSFODNN7EXAMPLE" },
+        { severity: "high", file: "README.md", line: 1, message: `Slack ${slackCredential}` },
+        { severity: "critical", file: "README.md", line: 1, message: "-----BEGIN RSA PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n-----END RSA PRIVATE KEY-----" },
+        { severity: "high", file: "README.md", line: 1, message: "opaque QWxhZGRpbjpPcGVuU2VzYW1lMTIzNDU2Nzg5MGFiY2RlZg==" },
+        { severity: "high", file: "README.md", line: 1, message: "Autho\\u200brization: Bearer SYNTH_INTRA_LABEL" },
+      ] }),
+    );
+    const ledgerRoot = mkdtempSync(join(tmpdir(), "pi-web-bridge-shapes-"));
+    const service = new PiSessionService(new CapturingSessionEventHub(), {
+      agentDir: join(ledgerRoot, "agent"),
+      modelRuntime: testModelRuntime,
+      sessionManager: sessionGateway([]),
+      archiveStore: emptyArchiveStore(),
+      spawnTargets: { resolveSpawnTarget: () => Promise.resolve({ allowed: true, cwd: "/workspace" }) },
+      reviewerBridge: new ExecFileHarnessReviewerBridge(reviewerBridgeOptions(ledgerRoot, port)),
+      heartbeatIntervalMs: 60_000,
+    });
+    try {
+      const result = await toolFor(service).execute("shape-call", { prompt: "review", logicalRole: "reviewer" }, undefined, undefined, context());
+      const sessionId = reviewerSessionIdOf(result.details);
+      const check = await waitForReviewerTerminalStatus(service, "integration-parent", sessionId);
+      const serialized = JSON.stringify(check);
+      expect(serialized).not.toContain("sk-live-");
+      expect(serialized).not.toContain("ghp_");
+      expect(serialized).not.toContain("AKIA");
+      expect(serialized).not.toContain(["xox", "b-"].join(""));
+      expect(serialized).not.toContain("PRIVATE KEY");
+      expect(serialized).not.toContain("QWxhZGR");
+      expect(serialized).not.toContain("SYNTH_INTRA_LABEL");
+      expect(check.finalText).toContain("<redacted>");
+    } finally {
+      await service.dispose();
+      await closeServer(server);
+      rmSync(ledgerRoot, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it("forwards parent cancellation and leaves no real proxy/socket orphan", async () => {
+    const { server, port } = await startFakeModelServer(5_000);
+    const ledgerRoot = mkdtempSync(join(tmpdir(), "pi-web-bridge-cancel-"));
+    const service = new PiSessionService(new CapturingSessionEventHub(), {
+      agentDir: join(ledgerRoot, "agent"),
+      modelRuntime: testModelRuntime,
+      sessionManager: sessionGateway([]),
+      archiveStore: emptyArchiveStore(),
+      spawnTargets: { resolveSpawnTarget: () => Promise.resolve({ allowed: true, cwd: "/workspace" }) },
+      reviewerBridge: new ExecFileHarnessReviewerBridge(reviewerBridgeOptions(ledgerRoot, port, 15_000)),
+      heartbeatIntervalMs: 60_000,
+    });
+    try {
+      const controller = new AbortController();
+      const pending = toolFor(service).execute("cancel-call", { prompt: "review slowly", logicalRole: "reviewer" }, controller.signal, undefined, context());
+      setTimeout(() => { controller.abort(); }, 500);
+      const result = await pending;
+      expect(result.terminate).toBe(true);
+      expect(result.details).toMatchObject({ result: { verdict: "review_denied", terminal_outcome: "denied" } });
+      await waitForNoReviewerTransportOrphans();
+    } finally {
+      await service.dispose();
+      await closeServer(server);
+      rmSync(ledgerRoot, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it("forwards the bridge timeout to Python and leaves no real proxy/socket orphan", async () => {
+    const { server, port } = await startFakeModelServer(5_000);
+    const ledgerRoot = mkdtempSync(join(tmpdir(), "pi-web-bridge-timeout-"));
+    const service = new PiSessionService(new CapturingSessionEventHub(), {
+      agentDir: join(ledgerRoot, "agent"),
+      modelRuntime: testModelRuntime,
+      sessionManager: sessionGateway([]),
+      archiveStore: emptyArchiveStore(),
+      spawnTargets: { resolveSpawnTarget: () => Promise.resolve({ allowed: true, cwd: "/workspace" }) },
+      reviewerBridge: new ExecFileHarnessReviewerBridge(reviewerBridgeOptions(ledgerRoot, port, 500)),
+      heartbeatIntervalMs: 60_000,
+    });
+    try {
+      const result = await toolFor(service).execute("timeout-call", { prompt: "review with a short bridge deadline", logicalRole: "reviewer" }, undefined, undefined, context());
+      expect(result.terminate).toBe(true);
+      expect(result.details).toMatchObject({ result: { verdict: "review_denied", terminal_outcome: "denied" } });
+      await waitForNoReviewerTransportOrphans();
+    } finally {
+      await service.dispose();
+      await closeServer(server);
+      rmSync(ledgerRoot, { recursive: true, force: true });
+    }
+  }, 90_000);
+});

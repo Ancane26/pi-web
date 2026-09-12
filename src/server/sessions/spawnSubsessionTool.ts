@@ -1,15 +1,20 @@
 import { Type } from "typebox";
 import { defineTool, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TranscriptContentKind, TranscriptEntry, TranscriptRole, TranscriptView } from "./subsessionTranscript.js";
+import type { ReviewerAuthorityRecord, ReviewerResult } from "./harnessReviewerBridge.js";
 
 /** Lifecycle phase of a tracked subsession as seen by its parent. */
 export type SubsessionStatus = "working" | "idle" | "error" | "unknown";
 
 export interface SpawnSubsessionResult {
-  sessionId: string;
+  sessionId?: string;
   cwd: string;
   /** Model the child session runs with, as `provider/id`; absent when unknown. */
   model?: string;
+  reviewerAuthority?: ReviewerAuthorityRecord;
+  terminal?: boolean;
+  terminate?: boolean;
+  result?: Record<string, unknown> | ReviewerResult;
 }
 
 export type SpawnSubsessionModel = NonNullable<ExtensionContext["model"]>;
@@ -37,6 +42,10 @@ export interface SpawnSubsessionInvocation {
   modelSpec?: string;
   /** Parent's current thinking level, inherited by the child session (pi clamps it to the child model's capabilities). */
   thinkingLevel?: SpawnSubsessionThinkingLevel;
+  /** Role-specific authority route; omitted preserves the legacy child path. */
+  logicalRole?: "reviewer";
+  /** Parent tool-call cancellation, forwarded to external reviewer transport. */
+  signal?: AbortSignal;
 }
 
 export interface SubsessionSummary {
@@ -86,10 +95,22 @@ const SpawnSubsessionParams = Type.Object({
   model: Type.Optional(Type.String({
     description: 'Model override for the child session, as an exact "provider/model-id". Set this field only when instructed to use a specific model or to choose an appropriate one. Otherwise omit it to inherit this session\'s model. An unknown value is rejected.',
   })),
+  logicalRole: Type.Optional(Type.Literal("reviewer", {
+    description: "Use the isolated harness reviewer route. Omit for the legacy tracked child path.",
+  })),
 });
 
 const ListSubsessionsParams = Type.Object({});
 const YieldToSubsessionsParams = Type.Object({});
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function renderReviewerFinding(value: unknown): string {
+  if (!isRecord(value) || typeof value["severity"] !== "string" || typeof value["file"] !== "string" || typeof value["line"] !== "number" || typeof value["message"] !== "string") return "";
+  return `[${value["severity"]}] ${value["file"]}:${String(value["line"])} ${value["message"]}`;
+}
 
 const CheckSubsessionParams = Type.Object({
   sessionId: Type.String({
@@ -201,7 +222,7 @@ export function createSubsessionToolDefinitions(spawningCwd: string, deps: Subse
     description: "Start a tracked child session in this session's working directory to carry out part of the current task and return immediately. Its transcript and result are available here after it finishes.",
     promptSnippet: "spawn_subsession: tracked child work in this workspace; result available after completion",
     parameters: SpawnSubsessionParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const parentSessionId = ctx.sessionManager.getSessionId();
       const parentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
       const result = await deps.spawn({
@@ -212,12 +233,28 @@ export function createSubsessionToolDefinitions(spawningCwd: string, deps: Subse
         ...(ctx.model === undefined ? {} : { model: ctx.model }),
         ...(params.model === undefined ? {} : { modelSpec: params.model }),
         ...(ctx.thinkingLevel === undefined ? {} : { thinkingLevel: ctx.thinkingLevel }),
+        ...(params.logicalRole === undefined ? {} : { logicalRole: params.logicalRole }),
+        ...(signal === undefined ? {} : { signal }),
       });
-      const modelNote = result.model === undefined ? "" : ` using model ${result.model}`;
-      return {
-        content: [{ type: "text", text: `Started tracked subsession ${result.sessionId} in ${result.cwd}${modelNote}. Continue other work, then join with yield_to_subsessions; do not poll.` }],
-        details: result,
+      const safeResult = result;
+      const resultRecord = isRecord(safeResult.result) ? safeResult.result : undefined;
+      const terminalOutcome = resultRecord?.["terminal_outcome"];
+      const findings = resultRecord?.["findings"];
+      const renderedFindings = Array.isArray(findings) ? findings.map(renderReviewerFinding).filter((finding) => finding !== "") : [];
+      const terminalText = safeResult.terminal === true
+        ? renderedFindings.length > 0
+          ? `${renderedFindings.join("\n\n")}\n\nReviewer completed${typeof terminalOutcome === "string" ? ` with outcome ${terminalOutcome}` : ""}. Do not retry this request.`
+          : `Tracked subsession ended terminally${typeof terminalOutcome === "string" ? ` with outcome ${terminalOutcome}` : ""}. Do not retry this request.`
+        : undefined;
+      const modelNote = safeResult.model === undefined ? "" : ` using model ${safeResult.model}`;
+      const toolResult = {
+        content: [{ type: "text" as const, text: terminalText ?? `Started tracked subsession ${safeResult.sessionId ?? "undefined"} in ${safeResult.cwd}${modelNote}. Continue other work, then join with yield_to_subsessions; do not poll.` }],
+        details: safeResult,
       };
+      // Pi's agent loop reads only AgentToolResult.terminate at the top level
+      // (agent-loop.js:385); details.terminate is UI metadata and cannot stop
+      // the follow-up model turn.
+      return safeResult.terminate === true ? { ...toolResult, terminate: true } : toolResult;
     },
   });
 

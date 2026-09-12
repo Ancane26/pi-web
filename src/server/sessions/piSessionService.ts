@@ -83,6 +83,7 @@ import { ExtensionDialogWaiters, effectiveExtensionDialogTimeoutMs, extensionDia
 import { DEFAULT_EXTENSION_DIALOGS_TIMEOUT_MS } from "../../config.js";
 import { createSpawnSessionToolDefinition, type SpawnSessionInvocation, type SpawnSessionResult } from "./spawnSessionTool.js";
 import { createSubsessionToolDefinitions, type SpawnSubsessionInvocation, type SpawnSubsessionResult, type SubsessionCheckResult, type SubsessionReadQuery, type SubsessionReadResult, type SubsessionStatus, type SubsessionSummary, type SubsessionToolDeps } from "./spawnSubsessionTool.js";
+import type { HarnessReviewerBridge, ReviewerAuthorityRecord, ReviewerBridgeLaunchResult, ReviewerResult, ReviewerTerminalOutcome } from "./harnessReviewerBridge.js";
 import { buildTranscriptView } from "./subsessionTranscript.js";
 import { planSessionCleanup, summarizeSessionCleanupExecution, type NormalizedSessionCleanupRequest, type SessionCleanupPlan } from "./sessionCleanup.js";
 import type { SpawnTargetDecision, SpawnTargetResolver } from "./spawnTargetResolver.js";
@@ -94,6 +95,24 @@ import {
 import { plainTextTheme } from "./plainTextTheme.js";
 import { SessionUnreadStore, type SessionUnreadMutation } from "./sessionUnreadStore.js";
 import { applyEnabledModelToggle, catalogWithEnabledFirst, modelScopeId, persistedEnabledModelPatterns, resolveEnabledModelIds, resolveSessionModelOptions, scopedModelsFromEnabledIds, type EnabledModelCatalogEntry } from "./sessionModelScope.js";
+
+function reviewerStatusFromOutcome(outcome: ReviewerTerminalOutcome | undefined): SubsessionStatus {
+  if (outcome === undefined) return "unknown";
+  return outcome === "succeeded" ? "idle" : "error";
+}
+
+function reviewerFinalText(result: ReviewerResult): string {
+  return JSON.stringify({ verdict: result.verdict, findings: result.findings });
+}
+
+function reviewerResultWithCwd(bridged: ReviewerBridgeLaunchResult, cwd: string): ReviewerBridgeLaunchResult {
+  const result: ReviewerBridgeLaunchResult = { cwd, terminal: bridged.terminal, terminate: bridged.terminate };
+  if (bridged.sessionId !== undefined) result.sessionId = bridged.sessionId;
+  if (bridged.model !== undefined) result.model = bridged.model;
+  if (bridged.reviewerAuthority !== undefined) result.reviewerAuthority = bridged.reviewerAuthority;
+  if (bridged.result !== undefined) result.result = bridged.result;
+  return result;
+}
 
 /**
  * Minimal structured-logging seam, shaped like Fastify's logger so sessiond can
@@ -246,6 +265,12 @@ interface TrackedSubsessionLink {
   childSessionFile?: string;
   parentSessionFile?: string;
   cwd?: string;
+  reviewerAuthority?: ReviewerAuthorityRecord;
+  /** In-memory cache of the reviewer's terminal result, once observed via
+   * reviewerBridge.status(). Avoids re-polling (and re-running cleanup for)
+   * an authority that has already finished. Never persisted -- a restart
+   * re-derives this the same way, by polling status() again. */
+  reviewerResult?: ReviewerResult;
 }
 
 interface PersistedParentSubsessionLink {
@@ -253,6 +278,7 @@ interface PersistedParentSubsessionLink {
   spawnedSessionId: string;
   spawnedSessionFile?: string;
   cwd?: string;
+  reviewerAuthority?: ReviewerAuthorityRecord;
 }
 
 interface PersistedChildSubsessionLink {
@@ -1073,6 +1099,8 @@ export interface PiSessionServiceDependencies {
    * delegation. On by default; the operator opts out via config or environment.
    */
   subsessionsEnabled?: boolean;
+  /** Role-specific isolated reviewer bridge; generic children never use it. */
+  reviewerBridge?: HarnessReviewerBridge;
   /**
    * When true, `ask_user` is available to every session, so an agent can post a
    * question set to the browser. Independent of the delegation capabilities: the
@@ -1188,6 +1216,7 @@ export class PiSessionService implements SessionRouteService {
   private readonly modelRuntime: ModelRuntime;
   private readonly workspaceActivity: Pick<WorkspaceActivityService, "applySessionStatus" | "applySessionActivity" | "removeSession" | "reconcileSessionActivity"> | undefined;
   private readonly spawnTargets: SpawnTargetResolver | undefined;
+  private readonly reviewerBridge: HarnessReviewerBridge | undefined;
   private readonly logger: PiSessionLogger;
   private readonly now: () => Date;
   private readonly notificationStore: SessionNotificationStore;
@@ -1218,6 +1247,7 @@ export class PiSessionService implements SessionRouteService {
     this.sessionManager = deps.sessionManager;
     this.modelRuntime = deps.modelRuntime;
     this.spawnTargets = deps.spawnTargets;
+    this.reviewerBridge = deps.reviewerBridge;
     this.logger = deps.logger ?? noopLogger;
     this.now = deps.now ?? (() => new Date());
     this.notificationStore = deps.notificationStore ?? new SessionNotificationStore();
@@ -1530,6 +1560,70 @@ export class PiSessionService implements SessionRouteService {
     // from an unregistered directory, which keeps the child visible in the UI.
     const decision = await this.spawnTargets.resolveSpawnTarget(input.spawningCwd, undefined);
     if (!decision.allowed) throw spawnTargetError(decision);
+    if (input.logicalRole === "reviewer") {
+      if (this.reviewerBridge === undefined) {
+        return {
+          cwd: decision.cwd,
+          terminal: true,
+          terminate: true,
+          result: {
+            verdict: "review_denied",
+            findings: [],
+            terminal_outcome: "denied",
+            observed_tools: [],
+            denied_operations: [{ reason: "tool_execution_denied" }],
+            work_id: `${input.parentSessionId}-reviewer-denied`,
+            model: "unavailable",
+          },
+        };
+      }
+      let bridged: ReviewerBridgeLaunchResult;
+      try {
+        bridged = await this.reviewerBridge.launch({
+          parentSessionId: input.parentSessionId,
+          parentSessionFile: input.parentSessionFile,
+          prompt: input.prompt,
+          ...(input.signal === undefined ? {} : { signal: input.signal }),
+        });
+      } catch {
+        // Transport failures are terminal authority failures, not ordinary Pi
+        // tool errors. In particular ENOENT, timeout, cancellation, malformed
+        // JSON, and a child protocol error must not invite the parent model to
+        // retry the same unavailable reviewer route.
+        return {
+          cwd: decision.cwd,
+          terminal: true,
+          terminate: true,
+          result: {
+            verdict: "review_denied",
+            findings: [],
+            terminal_outcome: "denied",
+            observed_tools: [],
+            denied_operations: [{ reason: "tool_execution_denied" }],
+            work_id: `${input.parentSessionId}-reviewer-unavailable`,
+            model: "unavailable",
+          },
+        };
+      }
+      if (bridged.terminal) return reviewerResultWithCwd(bridged, decision.cwd);
+      if (bridged.sessionId === undefined || bridged.reviewerAuthority === undefined) {
+        throw new Error("Reviewer bridge returned a non-terminal result without an authority handle");
+      }
+      const reviewerLink: TrackedSubsessionLink = {
+        parentSessionId: input.parentSessionId,
+        childSessionId: bridged.sessionId,
+        ...(input.parentSessionFile === undefined ? {} : { parentSessionFile: input.parentSessionFile }),
+        cwd: decision.cwd,
+        reviewerAuthority: bridged.reviewerAuthority,
+      };
+      await this.registerVerifiedSubsession(reviewerLink);
+      this.persistSubsessionLink(reviewerLink);
+      this.logger.info(
+        { parentSessionId: input.parentSessionId, sessionId: bridged.sessionId, cwd: decision.cwd, promptLength: input.prompt.length },
+        "spawn_subsession started an isolated reviewer child",
+      );
+      return reviewerResultWithCwd(bridged, decision.cwd);
+    }
     // A model spec overrides the inherited model and is resolved against the
     // parent's model runtime; only a spec resolves against the parent.
     const model = input.modelSpec === undefined
@@ -1938,7 +2032,9 @@ export class PiSessionService implements SessionRouteService {
 
   /** Status and final result of a subsession, scoped to the caller's children. */
   async checkSubsession(parentSessionId: string, sessionId: string, parentSessionFile?: string): Promise<SubsessionCheckResult> {
-    const session = await this.openSubsession(parentSessionId, sessionId, parentSessionFile);
+    const link = await this.authorizeSubsessionLink(parentSessionId, sessionId, parentSessionFile);
+    if (link.reviewerAuthority !== undefined) return this.checkReviewerSubsession(link);
+    const session = await this.getOrOpenTrackedSubsession(sessionId);
     const messages = historyMessages(session);
     return {
       sessionId,
@@ -1951,7 +2047,9 @@ export class PiSessionService implements SessionRouteService {
 
   /** Filtered, paginated transcript of a subsession, scoped to the caller's children. */
   async readSubsession(parentSessionId: string, sessionId: string, query: SubsessionReadQuery, parentSessionFile?: string): Promise<SubsessionReadResult> {
-    const session = await this.openSubsession(parentSessionId, sessionId, parentSessionFile);
+    const link = await this.authorizeSubsessionLink(parentSessionId, sessionId, parentSessionFile);
+    if (link.reviewerAuthority !== undefined) return this.readReviewerSubsession(link, query);
+    const session = await this.getOrOpenTrackedSubsession(sessionId);
     const view = buildTranscriptView(historyMessages(session), query);
     return {
       sessionId,
@@ -1961,14 +2059,54 @@ export class PiSessionService implements SessionRouteService {
     };
   }
 
-  /** Open a session after verifying it is one of the caller's tracked children. */
-  private async openSubsession(parentSessionId: string, sessionId: string, parentSessionFile?: string): Promise<PiAgentSession> {
+  /** Verify a session is one of the caller's tracked children and return its link. */
+  private async authorizeSubsessionLink(parentSessionId: string, sessionId: string, parentSessionFile?: string): Promise<TrackedSubsessionLink> {
     const parentFile = nonEmptyString(parentSessionFile);
     await this.hydrateSubsessionsForParent(parentSessionId, parentFile);
     if (this.subsessionParents.get(sessionId) !== parentSessionId || !this.subsessionLinkBelongsToParent(parentSessionId, parentFile, sessionId)) {
       throw new Error(`Session ${sessionId} is not one of your subsessions`);
     }
-    return this.getOrOpenTrackedSubsession(sessionId);
+    const link = this.subsessionLinks.get(sessionId);
+    if (link === undefined) throw new Error("Session not found");
+    return link;
+  }
+
+  /** Single non-blocking status check against a reviewer's external authority,
+   * cached in-memory once the reviewer reaches a terminal outcome so a later
+   * check/read does not re-invoke the bridge (and does not re-run cleanup). */
+  private async pollReviewerAuthority(link: TrackedSubsessionLink): Promise<{ status: SubsessionStatus; result?: ReviewerResult }> {
+    if (link.reviewerResult !== undefined) {
+      return { status: reviewerStatusFromOutcome(link.reviewerResult.terminal_outcome), result: link.reviewerResult };
+    }
+    if (this.reviewerBridge === undefined || link.reviewerAuthority === undefined) return { status: "error" };
+    let bridged: ReviewerBridgeLaunchResult;
+    try {
+      bridged = await this.reviewerBridge.status(link.reviewerAuthority);
+    } catch {
+      return { status: "error" };
+    }
+    if (!bridged.terminal) return { status: "working" };
+    if (bridged.result === undefined) return { status: reviewerStatusFromOutcome(undefined) };
+    link.reviewerResult = bridged.result;
+    return { status: reviewerStatusFromOutcome(bridged.result.terminal_outcome), result: bridged.result };
+  }
+
+  private async checkReviewerSubsession(link: TrackedSubsessionLink): Promise<SubsessionCheckResult> {
+    const { status, result } = await this.pollReviewerAuthority(link);
+    return {
+      sessionId: link.childSessionId,
+      cwd: link.cwd ?? "",
+      status,
+      finalText: result === undefined ? "" : reviewerFinalText(result),
+      messageCount: result === undefined ? 0 : 1,
+    };
+  }
+
+  private async readReviewerSubsession(link: TrackedSubsessionLink, query: SubsessionReadQuery): Promise<SubsessionReadResult> {
+    const { status, result } = await this.pollReviewerAuthority(link);
+    const messages = result === undefined ? [] : [{ role: "assistant", content: reviewerFinalText(result) }];
+    const view = buildTranscriptView(messages, query);
+    return { sessionId: link.childSessionId, cwd: link.cwd ?? "", status, ...view };
   }
 
   private subsessionLinkBelongsToParent(parentSessionId: string, parentSessionFile: string | undefined, childSessionId: string): boolean {
@@ -2129,6 +2267,7 @@ export class PiSessionService implements SessionRouteService {
   }
 
   private async parentLinkHasValidChildTarget(parentSessionFile: string, link: PersistedParentSubsessionLink): Promise<boolean> {
+    if (link.reviewerAuthority !== undefined) return true;
     return link.spawnedSessionFile !== undefined
       && await sessionFileHeaderMatches(link.spawnedSessionFile, { sessionId: link.spawnedSessionId, parentSessionFile });
   }
@@ -2155,6 +2294,15 @@ export class PiSessionService implements SessionRouteService {
     const active = this.activeChildForSubsessionLink(link);
     if (active !== undefined) return active.runtime.session;
 
+    if (link.reviewerAuthority !== undefined) {
+      // Reviewer children are an external authority, not a generic Pi
+      // session, so there is no PiAgentSession to return here -- callers
+      // that need a reviewer's status/result use pollReviewerAuthority()
+      // directly (see checkReviewerSubsession/readReviewerSubsession),
+      // which branch before ever reaching getOrOpenTrackedSubsession.
+      throw new Error("Reviewer child is an external authority session and has no generic Pi session file");
+    }
+
     if (link.childSessionFile !== undefined) {
       if (!(await sessionFileHeaderMatches(link.childSessionFile, { sessionId, parentSessionFile: link.parentSessionFile }))) throw new Error("Session not found");
       const sessionManager = this.sessionManager.open(link.childSessionFile);
@@ -2166,6 +2314,10 @@ export class PiSessionService implements SessionRouteService {
 
   private async subsessionSummaryFields(childSessionId: string): Promise<{ cwd: string; status: SubsessionStatus }> {
     const link = this.subsessionLinks.get(childSessionId);
+    if (link?.reviewerAuthority !== undefined) {
+      const { status } = await this.pollReviewerAuthority(link);
+      return { cwd: link.cwd ?? "", status };
+    }
     const active = link === undefined ? undefined : this.activeChildForSubsessionLink(link);
     if (active !== undefined) {
       return { cwd: active.runtime.cwd, status: this.subsessionStatus(active.runtime.session) };
@@ -4613,6 +4765,7 @@ function trackedSubsessionLinkFromParentLink(parentSessionId: string, link: Pers
     ...(link.spawnedSessionFile === undefined ? {} : { childSessionFile: link.spawnedSessionFile }),
     parentSessionFile,
     ...(link.cwd === undefined ? {} : { cwd: link.cwd }),
+    ...(link.reviewerAuthority === undefined ? {} : { reviewerAuthority: link.reviewerAuthority }),
   };
 }
 
@@ -4623,6 +4776,7 @@ function persistedParentSubsessionLinkData(link: TrackedSubsessionLink): Record<
     spawnedSessionId: link.childSessionId,
     ...(link.childSessionFile === undefined ? {} : { spawnedSessionFile: link.childSessionFile }),
     ...(link.cwd === undefined ? {} : { cwd: link.cwd }),
+    ...(link.reviewerAuthority === undefined ? {} : { reviewerAuthority: link.reviewerAuthority }),
   };
 }
 
@@ -4643,11 +4797,46 @@ function parsePersistedParentSubsessionLink(entry: unknown): PersistedParentSubs
   if (spawnedBySessionId === undefined || spawnedBySessionId === "" || spawnedSessionId === undefined || spawnedSessionId === "") return undefined;
   const spawnedSessionFile = getString(data, "spawnedSessionFile");
   const cwd = getString(data, "cwd");
+  const reviewerAuthority = parseReviewerAuthority(data["reviewerAuthority"]);
   return {
     spawnedBySessionId,
     spawnedSessionId,
     ...(spawnedSessionFile === undefined || spawnedSessionFile === "" ? {} : { spawnedSessionFile }),
     ...(cwd === undefined || cwd === "" ? {} : { cwd }),
+    ...(reviewerAuthority === undefined ? {} : { reviewerAuthority }),
+  };
+}
+
+function parseReviewerAuthority(value: unknown): ReviewerAuthorityRecord | undefined {
+  if (!isRecord(value)) return undefined;
+  const strings = ["workId", "stableWorktreeKey", "physicalWorktree", "providerSessionId", "providerToken"];
+  if (strings.some((key) => getString(value, key) === undefined)) return undefined;
+  const workId = getString(value, "workId");
+  const stableWorktreeKey = getString(value, "stableWorktreeKey");
+  const physicalWorktree = getString(value, "physicalWorktree");
+  const providerSessionId = getString(value, "providerSessionId");
+  const providerToken = getString(value, "providerToken");
+  const routeDigest = getString(value, "routeDigest");
+  const scopeDigest = getString(value, "scopeDigest");
+  const observedTools = value["observedTools"];
+  if (workId === undefined || stableWorktreeKey === undefined || physicalWorktree === undefined || providerSessionId === undefined || providerToken === undefined || routeDigest === undefined || scopeDigest === undefined || !Array.isArray(observedTools) || !observedTools.every((tool): tool is string => typeof tool === "string")) return undefined;
+  const attempt = value["attempt"];
+  if (typeof attempt !== "number" || !Number.isInteger(attempt) || attempt < 1) return undefined;
+  const pointer = value["terminalResultPointer"];
+  if (pointer !== undefined && (!isRecord(pointer) || getString(pointer, "label") === undefined || getString(pointer, "digest") === undefined || pointer["redacted"] !== true)) return undefined;
+  if (pointer !== undefined) {
+    const label = getString(pointer, "label");
+    const digest = getString(pointer, "digest");
+    if (label === undefined || digest === undefined) return undefined;
+    return {
+      workId, attempt, routeDigest, scopeDigest, stableWorktreeKey, physicalWorktree,
+      providerSessionId, providerToken, observedTools,
+      terminalResultPointer: { label, digest, redacted: true },
+    };
+  }
+  return {
+    workId, attempt, routeDigest, scopeDigest, stableWorktreeKey, physicalWorktree,
+    providerSessionId, providerToken, observedTools,
   };
 }
 
