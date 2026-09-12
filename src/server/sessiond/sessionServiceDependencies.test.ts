@@ -32,7 +32,6 @@ function daemonCollaborators(patch: Partial<SessionServiceDependencyInput> = {})
     extensionDialogsTimeoutMs: 300_000,
     reviewerBridge: {
       launch: () => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true }),
-      revalidate: () => Promise.resolve(false),
       status: () => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true }),
     },
     ...patch,
@@ -122,7 +121,6 @@ describe("sessiond session service dependency assembly", () => {
   it("passes the server-owned reviewer bridge through to the session service", () => {
     const reviewerBridge = {
       launch: () => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true }),
-      revalidate: () => Promise.resolve(false),
       status: () => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true }),
     };
 

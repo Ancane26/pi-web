@@ -101,7 +101,6 @@ describe("harness reviewer bridge boundary", () => {
           },
         });
       }),
-      revalidate: vi.fn(() => Promise.resolve(false)),
       status: vi.fn(() => Promise.resolve({ cwd: "/workspace", terminal: true, terminate: true })),
     };
     const service = new PiSessionService(new CapturingSessionEventHub(), {
@@ -125,7 +124,6 @@ describe("harness reviewer bridge boundary", () => {
 
     expect(history).toEqual(["reviewer-launch", "terminal-decision"]);
     expect(reviewerBridge.launch).toHaveBeenCalledTimes(1);
-    expect(reviewerBridge.revalidate).not.toHaveBeenCalled();
     expect(result).toMatchObject({ terminal: true, terminate: true, cwd: "/workspace" });
     await service.dispose();
   });
