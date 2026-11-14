@@ -12,7 +12,7 @@ permissions:
 jobs:
   publish:
     name: Publish to npm
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zahulhomeserver]
     environment: npm
     steps:
       - name: Checkout
@@ -46,7 +46,7 @@ jobs:
     # deploys from main via docs-dev.yml. Skipped on manual workflow_dispatch runs.
     if: github.event_name == 'release'
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zahulhomeserver]
     steps:
       # Release events check out the published tag, so docs match the npm release.
       - name: Checkout
