@@ -59,6 +59,8 @@ import { registerPairedPluginBackendRoutes, registerPluginBackendRoutes } from "
 import { registerWorkspaceRemovalRoutes } from "./sessiond/workspaceRemovalRoutes.js";
 import { createWorkspaceProviderRuntimeSnapshot } from "./workspaces/workspaceCatalog.js";
 import { WorkspaceRemovalService } from "./workspaces/workspaceRemovalService.js";
+import { ExecFileHarnessReviewerBridge } from "./sessions/harnessReviewerBridge.js";
+import { createReviewerBridgeOptions } from "./sessiond/reviewerBridgeConfig.js";
 
 const daemonEnvironment: NodeJS.ProcessEnv = Object.freeze({ ...process.env });
 const serverPluginRecovery = loadServerPluginRecoveryConfig({ env: daemonEnvironment });
@@ -263,6 +265,13 @@ async function createSessionDaemonRuntime() {
     machineStatus.notifyChanged();
     const projectWorkspaceDeps = { projects, workspaces: workspaceProviders };
     const spawnTargets = config.spawnSessions ? new ProjectScopedSpawnTargetResolver(projectWorkspaceDeps) : undefined;
+    // This bridge is always constructed at daemon startup, independently of
+    // provider enablement. The harness command owns the real repository,
+    // admission, confinement, and ledger configuration; the Pi Web caller can
+    // supply only the parent identity and prompt through the bridge protocol.
+    const reviewerBridge = new ExecFileHarnessReviewerBridge(
+      createReviewerBridgeOptions(daemonEnvironment, process.cwd()),
+    );
     const sessions = new PiSessionService(eventHub, sessionServiceDependencies({
       modelRuntime: auth.runtime,
       agentDir: activeAgentProfile.dir,
@@ -294,6 +303,7 @@ async function createSessionDaemonRuntime() {
       unreadStore,
       onUnreadChanged: () => { machineStatus.notifyChanged(); },
       catalogRefreshStatus: catalogRefresher,
+      reviewerBridge,
       sessionManager: createPiSessionManagerGateway({
         agentDir: activeAgentProfile.dir,
         env: daemonEnvironment,
