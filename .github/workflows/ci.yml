@@ -12,7 +12,7 @@ permissions:
 jobs:
   verify:
     name: Verify and package (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","zahulhomeserver"]') || matrix.os }}
     strategy:
       # Report Linux and Windows results independently instead of cancelling
       # the matrix on the first failure.

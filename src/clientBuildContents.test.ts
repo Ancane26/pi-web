@@ -37,7 +37,7 @@ describe("production client build contents", () => {
     } finally {
       await rm(outDir, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 });
 
 function htmlAssetReferences(html: string): string[] {
