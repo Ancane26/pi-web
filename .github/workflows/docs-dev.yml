@@ -34,6 +34,11 @@ jobs:
         env:
           GIT_SHA: ${{ github.sha }}
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
       - name: Deploy dev docs worker
         uses: cloudflare/wrangler-action@v3
         with:
