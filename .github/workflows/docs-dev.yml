@@ -24,7 +24,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy to pi-web.dev/dev
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zahulhomeserver]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
