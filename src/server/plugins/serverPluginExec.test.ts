@@ -88,12 +88,13 @@ describe("server plugin execFile helper", () => {
     })).rejects.toThrow("AbortSignal");
   });
 
-  it.skipIf(process.platform === "win32")("terminates the command process group when a deadline expires", async () => {
+  it.skipIf(process.platform === "win32")("terminates the command process group when the request is aborted after the descendant starts", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "pi-web-plugin-exec-tree-"));
     const pidPath = join(tempDir, "descendant.pid");
     let descendantPid: number | undefined;
     try {
-      const execFile = createServerPluginExecFile({ maxTimeoutMs: 200 });
+      const execFile = createServerPluginExecFile({ maxTimeoutMs: 30_000 });
+      const controller = new AbortController();
       const parentSource = `
         const { spawn } = require("node:child_process");
         const { writeFileSync } = require("node:fs");
@@ -102,12 +103,29 @@ describe("server plugin execFile helper", () => {
         setInterval(() => {}, 1000);
       `;
 
-      await expect(execFile({
+      const aborted = execFile({
         file: process.execPath,
         args: ["-e", parentSource],
-        signal: new AbortController().signal,
-      })).rejects.toThrow("200ms");
-      descendantPid = Number(await readFile(pidPath, "utf8"));
+        signal: controller.signal,
+      });
+      aborted.catch(() => undefined);
+
+      const deadline = Date.now() + 4_000;
+      while (descendantPid === undefined) {
+        const recorded = Number(await readFile(pidPath, "utf8").catch(() => ""));
+        if (Number.isInteger(recorded) && recorded > 0) {
+          descendantPid = recorded;
+        } else if (Date.now() >= deadline) {
+          controller.abort(new Error("descendant pid was never recorded"));
+          throw new Error("Descendant pid was never recorded");
+        } else {
+          await new Promise((resolvePromise) => { setTimeout(resolvePromise, 20); });
+        }
+      }
+
+      const abortError = new Error("test abort after descendant start");
+      controller.abort(abortError);
+      await expect(aborted).rejects.toBe(abortError);
 
       await expectProcessExit(descendantPid);
     } finally {
