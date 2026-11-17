@@ -64,6 +64,7 @@ describe("bundled Terminal package", () => {
     expect(appShellSource).not.toContain("selectedTerminalId");
   });
 
+  // Per-test budget: this test runs in-process Vite builds, which exceed the 5 s default under the parallel full-suite load.
   it("builds a package-complete self-contained browser graph and importable server graph", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-web-terminal-package-"));
     tempRoots.push(root);
@@ -140,5 +141,5 @@ describe("bundled Terminal package", () => {
     } finally {
       await runtime.stop();
     }
-  });
+  }, 15_000);
 });
