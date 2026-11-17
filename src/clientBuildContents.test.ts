@@ -9,6 +9,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 describe("production client build contents", () => {
   it("emits deployment-relative HTML and PWA URLs", async () => {
+    // Per-test budget: this test runs an in-process Vite build, which exceeds the 5 s default under the parallel full-suite load.
     const outDir = await mkdtemp(join(tmpdir(), "pi-web-client-build-"));
     try {
       await build({
@@ -37,7 +38,7 @@ describe("production client build contents", () => {
     } finally {
       await rm(outDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });
 
 function htmlAssetReferences(html: string): string[] {
